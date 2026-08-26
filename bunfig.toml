@@ -1,0 +1,3 @@
+# 仅供离线测试脚本（mask-test.tsx）使用：让 bun 将 solid-js 解析为浏览器端构建
+[runtime]
+conditions = ["browser", "import"]
