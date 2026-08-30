@@ -19,6 +19,12 @@ type TimelineNode = {
   summary: string
 }
 
+type TimelineGroup = {
+  key: string
+  label: string
+  nodes: TimelineNode[]
+}
+
 /** 类型守卫：只关心 type === "user" 的消息。 */
 function isUser(message: SessionMessageInfo): message is UserMessage {
   return message.type === "user"
@@ -73,12 +79,45 @@ function pad(value: number) {
   return value.toString().padStart(2, "0")
 }
 
+function dateKey(created: number) {
+  const date = new Date(created)
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
+}
+
+function formatDate(created: number) {
+  const date = new Date(created)
+  return `${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
+}
+
 function formatTime(created: number) {
   const date = new Date(created)
-  const now = new Date()
-  const sameDay = date.toDateString() === now.toDateString()
-  const time = `${pad(date.getHours())}:${pad(date.getMinutes())}`
-  return sameDay ? time : `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${time}`
+  return `${pad(date.getHours())}:${pad(date.getMinutes())}`
+}
+
+function groupNodes(values: TimelineNode[]) {
+  const groups: TimelineGroup[] = []
+  for (const node of values) {
+    const key = dateKey(node.created)
+    const previous = groups[groups.length - 1]
+    if (previous?.key === key) {
+      previous.nodes.push(node)
+      continue
+    }
+    groups.push({ key, label: formatDate(node.created), nodes: [node] })
+  }
+  return groups
+}
+
+function latestGroups(groups: TimelineGroup[], nodeLimit: number) {
+  const shown: TimelineGroup[] = []
+  let remaining = nodeLimit
+  for (let index = groups.length - 1; index >= 0 && remaining > 0; index--) {
+    const group = groups[index]
+    const nodes = group.nodes.slice(Math.max(0, group.nodes.length - remaining))
+    shown.unshift({ ...group, nodes })
+    remaining -= nodes.length
+  }
+  return shown
 }
 
 /** 宿主跳转命令可定位的用户消息（与宿主实现一致：跳过空白文本消息）。 */
@@ -541,8 +580,9 @@ function UserNodesPanel(props: PanelProps) {
 
   const nodes = createMemo(() => [...pool().values()].sort((a, b) => a.created - b.created))
   const readyNodes = createMemo(() => (initialReady() ? nodes() : []))
-  // 滚动模式显示全部；静态回退只显示最新 N 行。
-  const shown = createMemo(() => (props.scroll ? readyNodes() : readyNodes().slice(-props.visibleRows)))
+  const groups = createMemo(() => groupNodes(readyNodes()))
+  // 滚动模式显示全部；静态回退只显示最新 N 条消息，并保留日期标题。
+  const shownGroups = createMemo(() => (props.scroll ? groups() : latestGroups(groups(), props.visibleRows)))
 
   /** 单个节点行（滚动 / 静态两种容器共用）。 */
   function NodeRow(propsRow: { node: TimelineNode }) {
@@ -561,6 +601,15 @@ function UserNodesPanel(props: PanelProps) {
         <text fg={active() ? COLORS.accent : COLORS.text}>
           {truncate(propsRow.node.summary, 26)}
         </text>
+      </box>
+    )
+  }
+
+  function DateGroup(propsGroup: { group: TimelineGroup }) {
+    return (
+      <box flexDirection="column">
+        <text fg={COLORS.accent}>{`── ${propsGroup.group.label} ──`}</text>
+        <For each={propsGroup.group.nodes}>{(node) => <NodeRow node={node} />}</For>
       </box>
     )
   }
@@ -589,7 +638,7 @@ function UserNodesPanel(props: PanelProps) {
         <Show when={readyNodes().length > 0} fallback={<text fg={COLORS.muted}>{"暂无用户消息"}</text>}>
         <Show
           when={props.scroll}
-          fallback={<For each={shown()}>{(node) => <NodeRow node={node} />}</For>}
+          fallback={<For each={shownGroups()}>{(group) => <DateGroup group={group} />}</For>}
         >
           {/* 固定可视行数，剩余全部滚轮滚动；stickyScroll 保证新消息进来时保持在底部 */}
           <scrollbox
@@ -607,7 +656,7 @@ function UserNodesPanel(props: PanelProps) {
             verticalScrollbarOptions={{ visible: false }}
           >
             <box flexDirection="column" width="100%">
-              <For each={shown()}>{(node) => <NodeRow node={node} />}</For>
+              <For each={shownGroups()}>{(group) => <DateGroup group={group} />}</For>
             </box>
           </scrollbox>
         </Show>
