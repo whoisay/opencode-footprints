@@ -423,8 +423,8 @@ function UserNodesPanel(props: PanelProps) {
   }
 
   /**
-   * 服务端分页约束：limit 上限 200；翻页时只能带 cursor 单独传
-   * （cursor 内部已编码 order，重复带 order 参数会导致服务端返回空列表）。
+   * 服务端分页约束（2.0.2 实测）：limit 上限 200；翻页时只能带 cursor 单独传
+   * （cursor 内部已编码 order，重复带 order 参数会报 InvalidCursorError）。
    */
   async function fetchPage(sessionID: string, cursor?: string) {
     let response: Awaited<ReturnType<Context["client"]["message"]["list"]>>
@@ -468,8 +468,9 @@ function UserNodesPanel(props: PanelProps) {
   /**
    * 首次进入和 undo 时分页拉取完整历史；只有完整走到 cursor 尾端才权威替换，
    * 中途失败的部分结果只做合并，不能把已有早期节点截掉。
-   * 实测约束（beta-18269）：limit 上限 200；翻页时只能带 cursor 单独传
-   * （cursor 内部已编码 order，重复带 order 参数会导致服务端返回空列表）。
+   * 实测约束（2.0.2）：limit 上限 200；翻页时只能带 cursor 单独传
+   * （cursor 内部已编码 order，重复带 order 参数服务端直接报
+   * InvalidCursorError："Cursor cannot be combined with order"）。
    * fresh === 0 与页数上限是双保险，cursor 语义未来再变也不会死循环。
    */
   async function doFetchAll() {

@@ -1,6 +1,6 @@
 {
   "name": "opencode-user-timeline",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "OpenCode 2 TUI 插件：在会话侧边栏显示用户消息时间线，支持滚轮浏览与点击跳转定位。Sidebar timeline of your messages with scroll & click-to-jump.",
   "license": "MIT",
   "type": "module",
@@ -30,8 +30,8 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@opencode-ai/client": "beta",
-    "@opencode-ai/plugin": "beta"
+    "@opencode-ai/client": "0.0.0-beta-18866",
+    "@opencode-ai/plugin": "0.0.0-beta-18866"
   },
   "peerDependencies": {
     "@opentui/core": ">=0.5.8",
@@ -42,8 +42,8 @@
     "@babel/cli": "^8.0.4",
     "@babel/core": "^8.0.1",
     "@babel/preset-typescript": "^8.0.1",
-    "@opentui/core": "^0.5.8",
-    "@opentui/solid": "^0.5.8",
+    "@opentui/core": "0.5.10",
+    "@opentui/solid": "0.5.10",
     "@types/node": "^26.0.1",
     "babel-preset-solid": "^1.9.15",
     "solid-js": "^1.9.15",
