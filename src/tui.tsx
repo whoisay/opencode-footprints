@@ -156,7 +156,8 @@ async function waitForRenderable(context: Context, id: string, timeout = 10_000)
 type PagedHostMessages = Context["data"]["session"]["message"] & {
   more?(sessionID: string): boolean
   loading?(sessionID: string): boolean
-  loadMore?(sessionID: string): Promise<void>
+  /** 2.0.10 起接受可选 options：{ all: true } 单次拉全量，旧宿主忽略该参数（单次一页）。 */
+  loadMore?(sessionID: string, options?: { all?: boolean }): Promise<unknown>
 }
 
 /** 宿主当前缓存里的用户消息——保持宿主原序（宿主导航认这个顺序，不能重排）。 */
@@ -175,7 +176,7 @@ async function ensureLoaded(context: Context, sessionID: string, id: string): Pr
   const loading = messages.loading?.bind(messages)
   const loadMore = messages.loadMore?.bind(messages)
 
-  // v2 当前把底层分页对象原样交给插件，只是公开类型暂未列出这三个方法。
+  // v2 当前把底层分页对象原样交给插件，只是公开类型暂未列出这三个方法（2.0.10 仍如此）。
   // 直接分页不会像 session.first 那样留下一个最终 scrollTo(0) 的异步回调。
   if (more && loading && loadMore) {
     const deadline = Date.now() + 60_000
@@ -187,7 +188,9 @@ async function ensureLoaded(context: Context, sessionID: string, id: string): Pr
       }
       if (!more(sessionID)) return false
       try {
-        await loadMore(sessionID)
+        // 2.0.10：{ all: true } 由宿主在单次调用内循环翻页到 cursor 尽头（每页 200），
+        // 目标在很老的历史里时一次调用即可到位；旧宿主忽略该参数，仍按单页循环。
+        await loadMore(sessionID, { all: true })
       } catch {
         return false
       }
@@ -423,7 +426,7 @@ function UserNodesPanel(props: PanelProps) {
   }
 
   /**
-   * 服务端分页约束（2.0.2 实测）：limit 上限 200；翻页时只能带 cursor 单独传
+   * 服务端分页约束（2.0.2 → 2.0.10 均如此）：limit 上限 200；翻页时只能带 cursor 单独传
    * （cursor 内部已编码 order，重复带 order 参数会报 InvalidCursorError）。
    */
   async function fetchPage(sessionID: string, cursor?: string) {
@@ -468,7 +471,7 @@ function UserNodesPanel(props: PanelProps) {
   /**
    * 首次进入和 undo 时分页拉取完整历史；只有完整走到 cursor 尾端才权威替换，
    * 中途失败的部分结果只做合并，不能把已有早期节点截掉。
-   * 实测约束（2.0.2）：limit 上限 200；翻页时只能带 cursor 单独传
+   * 实测约束（2.0.2 → 2.0.10）：limit 上限 200；翻页时只能带 cursor 单独传
    * （cursor 内部已编码 order，重复带 order 参数服务端直接报
    * InvalidCursorError："Cursor cannot be combined with order"）。
    * fresh === 0 与页数上限是双保险，cursor 语义未来再变也不会死循环。
