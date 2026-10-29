@@ -1,13 +1,17 @@
 /** @jsxImportSource @opentui/solid */
 
-import { Plugin } from "@opencode-ai/plugin/tui"
-import type { Context } from "@opencode-ai/plugin/tui/context"
-import type { SessionMessageInfo } from "@opencode-ai/client"
+import { Plugin } from "@opencode/plugin/tui"
+import type { Context } from "@opencode/plugin/tui/context"
+import type { SessionMessageInfo } from "@opencode/client"
 import { createEffect, createMemo, createSignal, For, onCleanup, Show, untrack } from "solid-js"
 
-const COMMAND_ID = "user-timeline.toggle"
+const COMMAND_ID = "footprints.toggle"
 
-type Settings = { visible: boolean }
+type Settings = { visible: boolean; scrollStep: number }
+
+/** 可选步长：1（最细）到 5（最快） */
+const SCROLL_STEPS = [1, 2, 3, 5] as const
+const DEFAULT_STEP = 2
 
 /** 一条用户消息节点（SessionMessageInfo 联合类型中的 user 变体）。 */
 type UserMessage = Extract<SessionMessageInfo, { type: "user" }>
@@ -17,6 +21,8 @@ type TimelineNode = {
   id: string
   created: number
   summary: string
+  /** 完整消息文本（多行已合并），hover 时折行显示 */
+  full: string
 }
 
 type TimelineGroup = {
@@ -51,28 +57,25 @@ function truncate(value: string, max: number) {
   return out + "…"
 }
 
-/** 用户消息的首个非空行；纯附件消息显示附件数量。 */
-function summary(message: UserMessage) {
-  const line = (message.text ?? "")
-    .split("\n")
-    .map((item) => item.trim())
-    .find((item) => item.length > 0)
-  if (line) return line
-  const files = message.files?.length ?? 0
-  if (files > 0) return `[附件 ×${files}]`
-  return "(空消息)"
-}
 
 function timelineNode(message: UserMessage): TimelineNode {
+  const lines = (message.text ?? "")
+    .split("\n")
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0)
+  const files = message.files?.length ?? 0
+  const first = lines[0] ?? (files > 0 ? `[附件 ×${files}]` : "(空消息)")
   return {
     id: message.id,
     created: message.time.created,
-    summary: truncate(summary(message), 34),
+    summary: truncate(first, 34),
+    // 完整文本（多行合并成一段，便于折行显示），留 400 字上限防止极端长消息
+    full: truncate(lines.join(" ") || first, 400),
   }
 }
 
 function sameTimelineNode(a: TimelineNode, b: TimelineNode) {
-  return a.created === b.created && a.summary === b.summary
+  return a.created === b.created && a.summary === b.summary && a.full === b.full
 }
 
 function pad(value: number) {
@@ -239,10 +242,12 @@ interface MaskControl {
  * 用插件的全量列表（服务端历史）会因两边时间差导致光标落偏。
  */
 let jumping = false // 跳转重入保护：一次跳转未完成时忽略新的点击
+let hostJumpingUntil = 0 // 跳转期间及结束后一小段时间内，暂停"当前节点"自动检测
 
 async function jumpTo(context: Context, sessionID: string, clicked: TimelineNode, mask: MaskControl) {
   if (jumping) return
   jumping = true
+  hostJumpingUntil = Date.now() + 30_000 // 跳转期间全程抑制，结束后在 finally 里重设
   let masked = false
   try {
     let hosts = hostUsers(context, sessionID)
@@ -298,16 +303,19 @@ async function jumpTo(context: Context, sessionID: string, clicked: TimelineNode
   } finally {
     if (masked) await mask.drop()
     jumping = false
+    // 跳转结束后宿主可能还在异步滚动，再给 800ms 让位置稳定
+    hostJumpingUntil = Date.now() + 800
   }
 }
 
-/** 固定配色：取自 everforest 主题定义（darkStep9 绿即 primary.dark）。 */
+/** 固定配色：琥珀强调 + 冷白正文。 */
 const COLORS = {
-  text: "#d3c6aa", // darkStep12 — 正文
-  muted: "#7a8478", // darkStep11 — 弱化（时间、普通节点）
-  accent: "#a7c080", // darkStep9 — 强调绿（标题、选中、最新）
-  border: "#475258", // darkStep5 — 分隔线
-  background: "#2d353b", // darkStep1 — 遮盖层底色
+  text: "#ece3d4", // 正文：暖白（米白）
+  muted: "#9a9088", // 次要：时间、计数、跨度
+  accent: "#e0a458", // 强调：标题、选中点、滚动条、日期标题
+  soft: "#8a7d6a", // 悬停摘要：暖灰棕，与琥珀/暖灰同源
+  border: "#4a4238", // 分隔线：暖灰
+  background: "#2a2622", // 遮罩：暖深灰
 }
 
 type MaskState = { show: boolean; preview: string }
@@ -347,7 +355,132 @@ type PanelProps = {
   mask: MaskControl
 }
 
-/** 侧边栏面板：当前会话的用户消息节点列表（固定行高，剩余的可滚轮滚动）。 */
+/**
+ * 反查"会话视口顶部当前属于哪条用户消息"。
+ * 用渲染坐标：取 screenY 在视口顶部之上（含）的最后一条。
+ * 不能用行号累加——会话区里 assistant 回复占的行数不一样，
+ * scrollHeight 是渲染行数，不是消息条数。
+ */
+// 宿主会话区 scrollbox 的缓存：避免每 150ms 都遍历整棵渲染树
+let hostScrollCache: any
+// 上一次检测的 key（scrollTop + 节点版本）与结果，没变化就直接复用
+let lastDetectKey = ""
+let lastDetectResult: { id?: string; atBottom: boolean } = { atBottom: false }
+
+/** 找到宿主的会话区滚动容器（内容最高、且不是时间线自己那个），结果缓存。 */
+function getHostScroll(context: Context, exclude?: unknown) {
+  if (
+    hostScrollCache &&
+    hostScrollCache !== exclude &&
+    typeof hostScrollCache.scrollTop === "number" &&
+    (hostScrollCache.scrollHeight ?? 0) > 0
+  ) {
+    return hostScrollCache
+  }
+  try {
+    const root = (context.renderer as any)?.root
+    if (!root) return undefined
+    const boxes: any[] = []
+    const walk = (node: any, depth: number) => {
+      if (!node || depth > 24) return
+      if (
+        typeof node.scrollTop === "number" &&
+        typeof node.scrollHeight === "number" &&
+        node.scrollHeight > 0
+      ) {
+        boxes.push(node)
+      }
+      const kids = typeof node.getChildren === "function" ? node.getChildren() : []
+      for (const kid of kids) walk(kid, depth + 1)
+    }
+    walk(root, 0)
+    const found = boxes
+      .filter((box) => box !== exclude)
+      .sort((a, b) => b.scrollHeight - a.scrollHeight)[0]
+    hostScrollCache = found
+    return found
+  } catch {
+    hostScrollCache = undefined
+    return undefined
+  }
+}
+
+function detectCurrentNode(
+  context: Context,
+  nodes: TimelineNode[],
+  exclude?: unknown,
+): { id?: string; atBottom: boolean } {
+  try {
+    const scroll = getHostScroll(context, exclude)
+    if (!scroll) return { atBottom: false }
+
+    const offset = scroll.scrollTop ?? 0
+    const lastId = nodes[nodes.length - 1]?.id ?? ""
+    const key = `${offset}|${nodes.length}|${lastId}`
+    if (key === lastDetectKey) return lastDetectResult
+
+    const viewport = scroll.viewport ?? scroll
+    const top = viewport.screenY ?? 0
+    const view = viewport.height ?? 0
+    const total = scroll.scrollHeight ?? 0
+
+    let result: { id?: string; atBottom: boolean }
+
+    // 严格贴底（剩余可滚不足半行）→ 直接算最新那条
+    if (view > 0 && total > view && offset >= total - view - 0.5) {
+      result = { id: nodes[nodes.length - 1]?.id, atBottom: true }
+    } else {
+      // 视口顶部之上（含）的最后一条；滚到最顶上时退回第一条
+      const root = (context.renderer as any)?.root
+      let best: string | undefined
+      for (const node of nodes) {
+        const target =
+          typeof root?.findDescendantById === "function"
+            ? root.findDescendantById(node.id)
+            : undefined
+        if (!target) continue
+        const y = target.screenY ?? 0
+        if (y <= top + 1) best = node.id
+        else break
+      }
+      result = { id: best ?? nodes[0]?.id, atBottom: false }
+    }
+
+    lastDetectKey = key
+    lastDetectResult = result
+    return result
+  } catch {
+    return { atBottom: false }
+  }
+}
+
+/**
+ * 悬停浮层：按固定宽度折行，最多 4 行，超出部分用省略号。
+ * 侧边栏一行放不下多少字，所以用浮层而不是挤在分隔线里。
+ */
+function wrapSummary(text: string, width: number, maxLines: number): string[] {
+  const lines: string[] = []
+  for (let i = 0; i < text.length && lines.length < maxLines; i += width) {
+    lines.push(text.slice(i, i + width))
+  }
+  if (text.length > width * maxLines && lines.length === maxLines) {
+    lines[maxLines - 1] = lines[maxLines - 1].slice(0, Math.max(0, width - 1)) + "…"
+  }
+  return lines
+}
+
+/** 把毫秒跨度格式化成「3 天 8 小时」这种。 */
+function formatSpan(ms: number): string {
+  const minute = Math.floor(ms / 60_000)
+  if (minute < 1) return "不到 1 分钟"
+  if (minute < 60) return `${minute} 分钟`
+  const hour = Math.floor(minute / 60)
+  if (hour < 24) return `${hour} 小时 ${minute % 60} 分`
+  const day = Math.floor(hour / 24)
+  return `${day} 天 ${hour % 24} 小时`
+}
+
+/** 侧边栏面板「足迹」：当前会话的用户消息节点列表（固定行高，剩余的可滚轮滚动）。 */
 function UserNodesPanel(props: PanelProps) {
   // 节点池：id → 紧凑时间线节点。TUI 本地缓存只有"已加载窗口"（向上滚动才分页加载更早的），
   // 所以本地缓存负责实时增量，全量历史由 client.message.list 直接向服务端分页拉取。
@@ -356,6 +489,19 @@ function UserNodesPanel(props: PanelProps) {
   // 服务端全量回来后又变成 10 条。全量请求失败时仍会揭示本地缓存作为兜底。
   const [initialReady, setInitialReady] = createSignal(false)
   const [selected, setSelected] = createSignal<string>("")
+  // 日期跳转游标：-1 = 跟随最后一天，非负 = 用户选定的分组索引
+  const [dayIndex, setDayIndex] = createSignal(-1)
+  // 用户手动滚时间线后 3 秒内，不要被"宿主贴底"逻辑拉回最新
+  let manualScrollUntil = 0
+  // 宿主是否处于贴底状态：只在"由否变是"的那一刻联动一次，
+  // 否则切日期后会被持续条件反复拉回最新，日期切换失效。
+  let wasAtBottom = false
+  // 鼠标悬停的节点：在标题下方那几行显示完整摘要（列表里只截断到 26 字符）
+  const [hovered, setHovered] = createSignal<TimelineNode | undefined>(undefined)
+  let hoverClear: ReturnType<typeof setTimeout> | undefined
+  // 自绘滚动条状态（内置滑块是整块字符，太粗；这里用 ASCII | 画）
+  const [bar, setBar] = createSignal({ top: 0, size: 0, visible: false })
+  // 自绘滚动条状态已移除；内置滚动条改为同色 + 1 列宽
   let timelineScroll: { focus: () => void; blur: () => void } | undefined
   let prevLocalCount = 0 // 本地缓存中用户消息数：下降（undo）触发全量重拉
   let initialSessionID = ""
@@ -365,6 +511,11 @@ function UserNodesPanel(props: PanelProps) {
   // 进入面板时把 fallback focus 交给内部 scrollbox，离开时再还给宿主。
   function captureTimelineScroll(event: { stopPropagation: () => void }) {
     event.stopPropagation()
+    // 用户手动滚动时间线：3 秒内不要被"宿主贴底"逻辑拉回最新
+    manualScrollUntil = Date.now() + 3000
+    // 滚轮到达时立即重算滚动条位置，不等 50ms 定时器
+    updateBar()
+    setTimeout(updateBar, 0)
   }
 
   function focusTimelineScroll() {
@@ -577,14 +728,84 @@ function UserNodesPanel(props: PanelProps) {
   // 事件监听为主，20 秒低频轮询只负责最终一致性兜底。
   const poll = setInterval(() => mergeLocal(true), 20_000)
 
+  // 跟随宿主视口：反查当前显示的是哪条用户消息，实时更新选中。
+  // 点击跳转期间暂停，避免自动检测把刚选中的节点又冲掉。
+  const follow = setInterval(() => {
+    if (Date.now() < hostJumpingUntil) return
+    const found = detectCurrentNode(props.context, readyNodes(), timelineScroll)
+    if (found.id && found.id !== selected()) setSelected(found.id)
+    // 宿主贴底（比如点了 jump to latest）：时间线也回到最新。
+    // 只在"由非贴底变成贴底"那一下联动，之后不再干预用户操作。
+    if (found.atBottom) {
+      if (!wasAtBottom && Date.now() >= manualScrollUntil) {
+        const s = timelineScroll as any
+        if (s && typeof s.scrollTop === "number" && typeof s.scrollHeight === "number") {
+          if (s.scrollTop + props.visibleRows < s.scrollHeight - 1) s.scrollTo(s.scrollHeight)
+        }
+      }
+      wasAtBottom = true
+    } else {
+      wasAtBottom = false
+    }
+  }, 150)
+
+  // 自绘滚动条：按 scrollTop / scrollHeight 算滑块位置与长度
+  function updateBar() {
+    const scroll = timelineScroll as any
+    if (!scroll || typeof scroll.scrollTop !== "number" || typeof scroll.scrollHeight !== "number") return
+    const view = props.visibleRows
+    const total = scroll.scrollHeight
+    if (total > view) {
+      const size = Math.max(1, Math.round((view * view) / total))
+      const maxTop = Math.max(0, view - size)
+      const range = Math.max(1, total - view)
+      const top = Math.min(maxTop, Math.max(0, Math.round((scroll.scrollTop / range) * maxTop)))
+      const prev = bar()
+      if (prev.top !== top || prev.size !== size || !prev.visible) setBar({ top, size, visible: true })
+    } else if (bar().visible) {
+      setBar({ top: 0, size: 0, visible: false })
+    }
+  }
+  // 滚轮事件里立即刷新（不等定时器），50ms 轮询只做键盘翻页/程序滚动的兜底
+  const syncBar = setInterval(updateBar, 50)
+
   onCleanup(() => {
     stopListen()
     clearInterval(poll)
+    clearInterval(follow)
+    clearInterval(syncBar)
   })
 
   const nodes = createMemo(() => [...pool().values()].sort((a, b) => a.created - b.created))
   const readyNodes = createMemo(() => (initialReady() ? nodes() : []))
   const groups = createMemo(() => groupNodes(readyNodes()))
+  // 当前日期游标（-1 表示跟随最新一天）
+  const dayCursor = createMemo(() => {
+    const gs = groups()
+    if (gs.length === 0) return -1
+    return dayIndex() < 0 ? gs.length - 1 : Math.min(Math.max(0, dayIndex()), gs.length - 1)
+  })
+
+  /** 按天切换：把时间线滚到那一天的第一条，并选中它。 */
+  function jumpToDay(delta: number) {
+    const gs = groups()
+    if (gs.length === 0) return
+    const cur = dayCursor()
+    const next = Math.min(gs.length - 1, Math.max(0, cur + delta))
+    if (next === cur) return
+    setDayIndex(next)
+    const target = gs[next]?.nodes[0]
+    if (!target) return
+    setSelected(target.id)
+    // 切日期是用户的主动操作，3 秒内不要被"宿主贴底联动"拉回最新
+    manualScrollUntil = Date.now() + 3000
+    // scrollChildIntoView 只查直接子级，节点嵌在 box/DateGroup 里找不到，
+    // 所以按"日期标题 1 行 + 每条节点 1 行"累加出行号，直接 scrollTo。
+    let offset = 0
+    for (let i = 0; i < next; i++) offset += 1 + gs[i].nodes.length
+    const scroll = timelineScroll as any
+    if (typeof scroll?.scrollTo === "function") scroll.scrollTo(offset)
+  }
   // 滚动模式显示全部；静态回退只显示最新 N 条消息，并保留日期标题。
   const shownGroups = createMemo(() => (props.scroll ? groups() : latestGroups(groups(), props.visibleRows)))
 
@@ -596,8 +817,19 @@ function UserNodesPanel(props: PanelProps) {
         flexDirection="row"
         gap={1}
         onMouseUp={() => {
-          setSelected(propsRow.node.id)
+          const id = propsRow.node.id
+          setSelected(id)
+          // 跳转期间暂停自动跟随，跳完再交还
+          hostJumpingUntil = Date.now() + 1500
           void jumpTo(props.context, props.sessionID, propsRow.node, props.mask)
+        }}
+        onMouseOver={() => {
+          clearTimeout(hoverClear)
+          setHovered(propsRow.node)
+        }}
+        onMouseOut={() => {
+          // 悬停会撑高上方区域、把列表往下推，鼠标可能瞬间移出；延迟清除防抖
+          hoverClear = setTimeout(() => setHovered(undefined), 250)
         }}
       >
         <text fg={COLORS.muted}>{formatTime(propsRow.node.created)}</text>
@@ -634,10 +866,48 @@ function UserNodesPanel(props: PanelProps) {
       onMouseDown={focusTimelineScroll}
     >
       <box flexDirection="row" gap={1}>
-        <text fg={COLORS.accent}>{"◆ 用户节点"}</text>
+        <text fg={COLORS.accent}>{"◆ 足迹"}</text>
         <text fg={COLORS.muted}>{initialReady() ? `(${readyNodes().length})` : "(加载中…)"}</text>
       </box>
-      <text fg={COLORS.border}>{"─".repeat(16)}</text>
+      {/* 固定占 2 行：不悬停时显示跨度 + 日期切换，悬停时整块换成摘要 */}
+      <Show
+        when={hovered()}
+        fallback={
+          <box flexDirection="column" height={2}>
+            <text fg={COLORS.muted} height={1} overflow="hidden">
+              {(() => {
+                const list = readyNodes()
+                if (list.length === 0) return ""
+                if (list.length === 1) return "单条消息"
+                const ms = list[list.length - 1].created - list[0].created
+                return `跨度 ${formatSpan(ms)}`
+              })()}
+            </text>
+            <box flexDirection="row" gap={1} height={1}>
+              <text fg={COLORS.muted} onMouseUp={() => jumpToDay(-1)}>
+                {"◀"}
+              </text>
+              <text fg={COLORS.accent}>{groups()[dayCursor()]?.label ?? "—"}</text>
+              <text fg={COLORS.muted} onMouseUp={() => jumpToDay(1)}>
+                {"▶"}
+              </text>
+              <text fg={COLORS.border}>
+                {groups().length > 0 ? `${dayCursor() + 1}/${groups().length}` : ""}
+              </text>
+            </box>
+          </box>
+        }
+      >
+        <box flexDirection="column" height={2}>
+          <For each={[0, 1]}>
+            {(i) => (
+              <text fg={COLORS.soft} height={1} overflow="hidden">
+                {wrapSummary(hovered()!.full, 30, 2)[i] ?? ""}
+              </text>
+            )}
+          </For>
+        </box>
+      </Show>
       <Show when={initialReady()} fallback={<text fg={COLORS.muted}>{"正在加载用户消息…"}</text>}>
         <Show when={readyNodes().length > 0} fallback={<text fg={COLORS.muted}>{"暂无用户消息"}</text>}>
         <Show
@@ -645,24 +915,52 @@ function UserNodesPanel(props: PanelProps) {
           fallback={<For each={shownGroups()}>{(group) => <DateGroup group={group} />}</For>}
         >
           {/* 固定可视行数，剩余全部滚轮滚动；stickyScroll 保证新消息进来时保持在底部 */}
-          <scrollbox
-            ref={(scroll) => {
-              timelineScroll = scroll
-            }}
-            height={props.visibleRows}
-            width="100%"
-            alignSelf="stretch"
-            stickyScroll
-            stickyStart="bottom"
-            // 嵌套在宿主侧边栏滚动容器中；无论事件命中行、content 还是
-            // scrollbox 本身，都在这里截断冒泡，避免外层跟着滚动。
-            onMouseScroll={captureTimelineScroll}
-            verticalScrollbarOptions={{ visible: false }}
-          >
-            <box flexDirection="column" width="100%">
-              <For each={shownGroups()}>{(group) => <DateGroup group={group} />}</For>
+          <box flexDirection="column" width="100%" height={props.visibleRows}>
+            <scrollbox
+              ref={(scroll) => {
+                timelineScroll = scroll
+              }}
+              height={props.visibleRows}
+              width="100%"
+              alignSelf="stretch"
+              stickyScroll
+              stickyStart="bottom"
+              // 宿主只给自己的容器注入 scrollAcceleration，插件自建的 scrollbox
+              // 不传就退回默认实现（每格 1 行），长会话几乎翻不动（issue #3）。
+              scrollAcceleration={{ tick: () => props.scrollStep, reset: () => {} }}
+              // 内置滚动条隐藏，用右侧自绘的细线版本
+              verticalScrollbarOptions={{ visible: false }}
+              // 嵌套在宿主侧边栏滚动容器中；无论事件命中行、content 还是
+              // scrollbox 本身，都在这里截断冒泡，避免外层跟着滚动。
+              onMouseScroll={captureTimelineScroll}
+            >
+              <box flexDirection="column" width="100%">
+                <For each={shownGroups()}>{(group) => <DateGroup group={group} />}</For>
+              </box>
+            </scrollbox>
+            {/* 右侧自绘滚动条：往内缩一列，避开侧边栏自身的滚动条 */}
+            <box
+              position="absolute"
+              right={1}
+              top={0}
+              width={1}
+              height={props.visibleRows}
+              zIndex={5}
+              flexDirection="column"
+            >
+              <For each={Array.from({ length: props.visibleRows }, (_, i) => i)}>
+                {(i) => {
+                  // 必须包成 memo：<For> 对相同数字不会重建 children，
+                  // 直接写 const on = ... 只会求值一次。
+                  const on = createMemo(() => {
+                    const b = bar()
+                    return b.visible && i >= b.top && i < b.top + b.size
+                  })
+                  return <text fg={COLORS.accent}>{on() ? "▌" : " "}</text>
+                }}
+              </For>
             </box>
-          </scrollbox>
+          </box>
         </Show>
         </Show>
       </Show>
@@ -684,19 +982,36 @@ function Keybinds(props: KeybindsProps) {
     commands: [
       {
         id: COMMAND_ID,
-        title: "切换用户消息节点面板",
-        description: "在会话侧边栏显示/隐藏用户消息节点列表",
-        group: "User Nodes",
+        title: "足迹：显示 / 隐藏面板",
+        description: "在会话侧边栏显示或隐藏「足迹」面板",
+        group: "Footprints",
         bind: "alt+u",
         palette: true,
-        slash: { name: "nodes" },
+        slash: { name: "footprints" },
         run: async () => {
           await props.update((draft) => {
             draft.visible = !draft.visible
           })
           props.context.ui.toast.show({
-            message: props.settings.visible ? "用户节点面板：已显示" : "用户节点面板：已隐藏",
+            message: props.settings.visible ? "足迹面板：已显示" : "足迹面板：已隐藏",
           })
+        },
+      },
+      {
+        id: "footprints.scroll-step",
+        title: "足迹：切换滚轮步长",
+        description: "在 1 / 2 / 3 / 5 行之间循环，调快或调慢时间线面板的滚轮滚动",
+        group: "Footprints",
+        palette: true,
+        slash: { name: "footprints-step" },
+        run: async () => {
+          const current = props.settings.scrollStep ?? DEFAULT_STEP
+          const index = SCROLL_STEPS.indexOf(current as (typeof SCROLL_STEPS)[number])
+          const next = SCROLL_STEPS[(index + 1) % SCROLL_STEPS.length]
+          await props.update((draft) => {
+            draft.scrollStep = next
+          })
+          props.context.ui.toast.show({ message: `足迹面板滚轮步长：${next} 行/格` })
         },
       },
     ],
@@ -707,7 +1022,7 @@ function Keybinds(props: KeybindsProps) {
 }
 
 export default Plugin.define({
-  id: "opencode-user-timeline",
+  id: "opencode-footprints",
   setup(context) {
     const visibleRows = typeof context.options.visibleRows === "number" && context.options.visibleRows > 0
       ? Math.floor(context.options.visibleRows)
@@ -717,7 +1032,7 @@ export default Plugin.define({
     const scroll = context.options.scroll !== false
 
     const [settings, updateSettings] = context.storage.store("settings", {
-      initial: { visible: true } satisfies Settings,
+      initial: { visible: true, scrollStep: DEFAULT_STEP } satisfies Settings,
     })
 
     // 遮盖层状态（内存态，重启即弃），配合 app 级 slot 渲染全屏定位遮罩。
@@ -755,10 +1070,18 @@ export default Plugin.define({
     })
 
     const unpick = context.ui.slot({
-      append: "sidebar.content",
+      // prepend：插到侧边栏内容最前面（append 会排到 Token/Context/MCP/Sessions 之后）
+      prepend: "sidebar.content",
       render: ({ sessionID }) => (
         <Show when={settings.visible && typeof sessionID === "string" && sessionID.length > 0}>
-          <UserNodesPanel context={context} sessionID={sessionID} visibleRows={visibleRows} scroll={scroll} mask={maskControl} />
+          <UserNodesPanel
+            context={context}
+            sessionID={sessionID}
+            visibleRows={visibleRows}
+            scroll={scroll}
+            scrollStep={settings.scrollStep ?? DEFAULT_STEP}
+            mask={maskControl}
+          />
         </Show>
       ),
     })

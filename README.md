@@ -1,119 +1,132 @@
-# opencode-user-timeline
+# 足迹 · opencode-footprints
 
-![用户节点面板](docs/screenshot.png)
+OpenCode 侧边栏的**用户提问时间线**：按日期分组列出当前会话里你说过的每一句，点一下跳回去，滚动时自动跟随，还能按天快速切换。
 
-OpenCode 2 TUI 插件：在**会话侧边栏**显示当前会话的用户消息节点列表（类似对话时间线/大纲）。已适配 OpenCode **2.0.10**（正式版渠道）。
+> 由 [huahai0202/opencode-user-timeline](https://github.com/huahai0202/opencode-user-timeline) 分叉而来，在原版基础上重做了交互与配色。MIT 协议。
 
-> English: an OpenCode 2 TUI plugin that lists your messages of the current session
-> in the sidebar — scroll through full history and click any node to jump to that
-> message. Install: `opencode2 plugin add opencode-user-timeline`.
+---
 
-## 安装
-
-```sh
-opencode2 plugin add opencode-user-timeline
-```
-
-（也可以手动在 `cli.json` 的 `plugins` 数组里加 `"opencode-user-timeline"`。）
-
-效果（每项 = 一条用户消息节点，最新一条高亮）：
+## 效果
 
 ```
-◆ 用户节点 (3)
-────────────────
-── 08-29 ──
-14:02 ─ 那之前的那个400多行的脚本移…
-14:15 ─ 清理过程中发现 pnpm 缓存…
-── 08-30 ──
-14:31 ━ 桌面快捷方式仍指向补丁版…
+◆ 足迹 (96)
+跨度 1 天 3 小时
+◀ 10-30 ▶  3/3
+01:12 ─ 现在还有什么可以改进的吗
+01:16 ─ 我决定自己建仓库，发布属…
+01:18 ─ 我感觉这个配色不好
+01:24 ─ 算了还是换成最开始那种配…
+01:30 ─ 可以
+01:32 ● 以及我觉得他不应该在右侧…
 ```
 
 ## 功能
 
-- 挂载在 `sidebar.content` 插槽，随会话切换自动刷新
-- **固定显示 10 行，剩余历史滚轮滚动**：列表区是 `scrollbox`
-  （`stickyScroll` 吸附底部），新消息进来始终停在最新一条
-- **全量节点**：通过 `context.client.message.list` 分页向服务端拉取完整历史，
-  不依赖 TUI 会话窗口的懒加载（刚打开会话无需手动上滚即可看到全部节点）；
-  TUI 本地缓存只用于实时增量（新消息即时出现）。首次进入和 undo 才全量重建，
-  正常新增只从最新页拉到首个已知节点；节点池仅保存 ID、时间和摘要
-- **点击节点直达对应消息**：复用宿主内置导航命令，步数按宿主当前缓存计算
-  （与宿主导航读同一数据源，落点精确）；目标已加载时零扰动直达；尚未加载时
-  先盖全屏遮盖层（"◆ 正在定位消息…" + 目标预览），罩后直接逐页加载到目标，
-  再触发宿主挂载完整 transcript；确认最终落点的 renderable 已出现后才执行回退定位，
-  在罩下完成落位后再摘罩——看不到加载过程，也不会在首次行构建完成前提前导航。
-  遮盖层用 slot + 绝对定位自绘，
-  不走 dialog（宿主滚动命令会关闭 dialog）
-- 被点击节点显示 `●` 高亮
-- **按日期分组**：跨日会话以日期标题分隔，节点行只显示当天的时分
-- 监听服务端 message/session 事件实时更新，另有 20 秒低频本地轮询兜底
-- 节点标记统一为 `─`，点击选中的那条显示 `●` 高亮
-- 面板显隐状态持久化（`context.storage.store`），重启 TUI 后保留
-- 配色固定为 everforest 主题色（绿 `#a7c080`），见 `src/tui.tsx` 顶部 `COLORS`，可自行修改
+| 功能 | 说明 |
+|---|---|
+| **时间线列表** | 按日期分组，固定高度，超出部分滚动 |
+| **点击跳转** | 点任意节点，主会话跳到那条消息 |
+| **当前节点跟随** | 滚动主会话时，圆点自动移到视口对应的那条 |
+| **日期切换** | `◀` / `▶` 在日期之间跳，时间线滚到那天第一条 |
+| **跨度统计** | 显示这段会话跨了多久、共多少条 |
+| **悬停预览** | 鼠标停在节点上，标题下方展开两行完整内容 |
+| **贴底联动** | 主会话回到底部（如 jump to latest）时，时间线也回到最新 |
+| **可调步长** | 滚轮每格 1/2/3/5 行，用命令切换 |
+| **细滚动条** | 右侧 1 列宽，只在内容超出时出现 |
 
-## 操作
+## 安装
 
-| 方式 | 命令 |
-| --- | --- |
-| 快捷键 | `Alt+U` |
-| 命令面板 | `Ctrl+P` → "切换用户消息节点面板" |
-| 斜杠命令 | `/nodes` |
+**npm / GitHub（发布后）**
 
-如需改键位，在 `cli.json` 的 `keybinds` 里对 `user-timeline.toggle` 重新绑定。
+```bash
+opencode plugin add opencode-footprints
+# 或
+opencode plugin add github:你的用户名/opencode-footprints
+```
 
-## 安装 / 卸载
+**本地目录**
 
-已在本机全局配置注册（`cli.json` → `plugins` 数组中的 file URL）。
-卸载：从 `cli.json` 的 `plugins` 数组中删除对应行，或改为 `-user-nodes` 前缀禁用。
+`opencode.json`：
 
-## 选项（可选）
+```jsonc
+{
+  "plugins": ["D:/path/to/opencode-footprints"]
+}
+```
 
-`cli.json` 中可传选项；`visibleRows` 调整可视行数（默认 10），`scroll: false`
-关闭滚轮滚动区、退回静态最新 N 行（scrollbox 走原生渲染核心，个别 beta 版本
-可能不稳定时的退路，不用改代码）：
+路径必须是**目录**（OpenCode 会读目录里的 `package.json` 和 `exports["./tui"]`）。
 
-```json
+## 配置
+
+```jsonc
 {
   "plugins": [
     {
-      "package": "opencode-user-timeline",
-      "options": { "visibleRows": 10, "scroll": true }
+      "package": "opencode-footprints",
+      "options": {
+        "visibleRows": 10,   // 面板固定显示几行，默认 10
+        "scroll": true       // false = 退回静态显示最新 N 条，不启用滚动区
+      }
     }
   ]
 }
 ```
 
-## 开发
+`scroll: false` 是给个别 beta 版本留的退路——scrollbox 走原生渲染核心，个别版本上可能不稳定。
 
-```sh
-npm install        # 仅为类型检查/编辑器补全；运行时由 OpenCode 解析依赖
-npx tsc --noEmit   # 类型检查
-bun mask-test.tsx  # 离线渲染测试：验证全屏遮盖层布局（bunfig.toml 为其服务）
-```
+## 命令
 
-- `src/tui.tsx` — TUI 插件主体（`@opencode-ai/plugin/tui`）
-- `src/index.ts` — 服务端壳（`tui: true`，按包发布时可自动加载 TUI 部分）
+| 命令 | 快捷键 | 说明 |
+|---|---|---|
+| `/footprints` | `alt+u` | 显示 / 隐藏面板 |
+| `/footprints-step` | — | 循环切换滚轮步长（1 / 2 / 3 / 5 行） |
+
+命令面板里搜「足迹」也能找到这两条。步长设置会持久保存。
+
+## 配色
+
+固定色板，不跟随 OpenCode 主题：
+
+| 用途 | 色值 |
+|---|---|
+| 强调（标题 / 圆点 / 滚动条 / 日期） | `#e0a458` 琥珀 |
+| 正文 | `#ece3d4` 暖白 |
+| 悬停摘要 | `#8a7d6a` 暖灰棕 |
+| 次要（时间 / 计数 / 跨度） | `#9a9088` 暖灰 |
+| 分隔线 | `#4a4238` 暖灰 |
+| 跳转遮罩 | `#2a2622` 暖深灰 |
+
+面板本身透明，用终端自己的底色。
+
+## 与上游的差异
+
+相对 `huahai0202/opencode-user-timeline@0.2.4`：
+
+- **滚轮步长**：原版插件自建的 scrollbox 没传 `scrollAcceleration`，退回默认实现（每格 1 行），长会话几乎翻不动（上游 issue #3）。这里传了自定义加速器，并做成可调命令。
+- **当前节点跟随**：新增。按 `screenY` 反查视口顶部对应的用户消息，自动更新圆点；跳转期间抑制，避免刚选中就被弹回。
+- **日期切换**：新增。`◀`/`▶` 按分组跳转，用行号计算 `scrollTo` 位置。
+- **悬停预览**：新增。两行、固定高度，不会因为撑高布局而频闪。
+- **贴底联动**：新增。主会话回到底部时时间线跟随（边沿触发，手动滚动后 3 秒内不打扰）。
+- **配色**：改为暖色系固定色板。
+- **命令**：加 `footprints.*` 前缀，新增步长切换。
+
+同时修了上游仓库 main 落后于 npm 的问题（`@opencode-ai/plugin` → `@opencode/plugin`），否则源码构建出来加载不了。
 
 ## 已知限制
 
-- **翻页的正确姿势（2.0.2 → 2.0.10 均如此，服务端源码确认）**：
-  `GET /api/session/{id}/message` 的 cursor 内部已编码 order——首页带
-  `order=desc&limit=200`，后续页**只能单独带 cursor**；重复带 order 服务端会报
-  `InvalidCursorError`（"Cursor cannot be combined with order"，服务端默认 limit 50）。
-  插件照此实现，任意长度会话全量拉取。
-- v2 插槽 API 无法在对话流内部逐条消息旁注入 UI，所以节点面板位于侧边栏而不是截图那样的消息左侧行内轨道。
-- 未加载节点会通过宿主分页数据层按需加载。插件优先使用宿主运行时的
-  `message.loadMore`；2.0.10 起该 API 支持 `loadMore(id, { all: true })`——宿主在
-  单次调用内循环翻页（每页 200）到最早一条，跳转很老的消息只需一次调用；
-  旧宿主忽略该参数时退回逐页循环，仍没有该能力时才回退 `session.first` 命令。
-- `session.first`（2.0.10 改用 `loadMore({ all: true, beforePublish })` 实现）加载完后
-  仍会执行最终 `scrollTo(0)` 置顶，异步收尾在目标消息进入缓存之后才结束；未加载节点的
-  主路径因此不经过该命令，避免它的最终置顶覆盖插件落点。
-- 点击跳转复用宿主的"上一条用户消息"命令逐步回退定位；2.0.10 的该命令在向上走完
-  已渲染窗口后会自动翻页续走（宿主改进），定位更稳。空白文本（纯附件）的消息
-  宿主无法直接定位，点击后会落在它上方最近的可定位消息上（与宿主行为一致）。
-- 宿主 2.0.10 内置了"Jump to message"时间线弹窗（`<leader>g` / `session.timeline`），
-  以列表方式选消息跳转；本插件提供的是侧边栏常驻节点面板 + 滚轮浏览 + 单击直达，
-  两者互补。
-- 历史很长（上百条用户消息）时点击最顶端节点会连续 dispatch 较多次导航命令，
-  命令本身是同步的状态更新，耗时可忽略，但极端变态长会话下可能有轻微滚动动画。
+- **依赖宿主渲染结构**：当前节点跟随靠 `context.renderer.root.findDescendantById` 和 `screenY`。OpenCode 改布局就可能失效，届时跟随会退化成"不更新"而不是报错。
+- **需要 OpenCode 2.x**（`@opencode/plugin` 2.0.x 系列）。
+- 气泡/圆点的位置以**视口顶部**为准：视口顶部是助手回复时，圆点停在上一条用户消息。
+
+## 开发
+
+```bash
+npm install
+npm run build     # babel src -> dist
+```
+
+改完 `dist` 后，OpenCode 会热重载本地插件目录（不行就重启）。
+
+## License
+
+MIT，见 [LICENSE](./LICENSE)。原版版权归原作者。

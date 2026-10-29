@@ -1,18 +1,20 @@
 {
-  "name": "opencode-user-timeline",
-  "version": "0.2.3",
-  "description": "OpenCode 2 TUI 插件：在会话侧边栏显示用户消息时间线，支持滚轮浏览与点击跳转定位。Sidebar timeline of your messages with scroll & click-to-jump.",
+  "name": "opencode-footprints",
+  "version": "1.0.0",
+  "description": "侧边栏「足迹」：当前会话的用户提问时间线，支持点击跳转、按日期切换、跟随当前视口、悬停预览。",
   "license": "MIT",
   "type": "module",
   "repository": {
     "type": "git",
-    "url": "https://github.com/huahai0202/opencode-user-timeline.git"
+    "url": "https://github.com/你的用户名/opencode-footprints.git"
   },
   "keywords": [
     "opencode",
     "opencode-plugin",
     "opencode2",
-    "tui"
+    "tui",
+    "timeline",
+    "footprints"
   ],
   "engines": {
     "opencode": ">=2.0.2"
@@ -27,23 +29,24 @@
   "scripts": {
     "build": "babel src --out-dir dist --extensions .ts,.tsx",
     "prepublishOnly": "npm run build",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "prepare": "npm run build"
   },
   "dependencies": {
-    "@opencode-ai/client": "0.0.0-beta-19271",
-    "@opencode-ai/plugin": "0.0.0-beta-19271"
+    "@opencode/client": "2.0.32",
+    "@opencode/plugin": "2.0.32"
   },
   "peerDependencies": {
-    "@opentui/core": ">=0.5.10",
-    "@opentui/solid": ">=0.5.10",
+    "@opentui/core": ">=0.5.17 <0.6.0",
+    "@opentui/solid": ">=0.5.17 <0.6.0",
     "solid-js": ">=1.9.0"
   },
   "devDependencies": {
     "@babel/cli": "^7.29.7",
     "@babel/core": "^7.29.7",
     "@babel/preset-typescript": "^7.27.1",
-    "@opentui/core": "0.5.11",
-    "@opentui/solid": "0.5.11",
+    "@opentui/core": "0.5.17",
+    "@opentui/solid": "0.5.17",
     "@types/node": "^26.0.1",
     "babel-preset-solid": "1.9.12",
     "solid-js": "1.9.12",
