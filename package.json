@@ -6,7 +6,7 @@
   "type": "module",
   "repository": {
     "type": "git",
-    "url": "https://github.com/你的用户名/opencode-footprints.git"
+    "url": "git+https://github.com/whoisay/opencode-footprints.git"
   },
   "keywords": [
     "opencode",
@@ -51,5 +51,10 @@
     "babel-preset-solid": "1.9.12",
     "solid-js": "1.9.12",
     "typescript": "^6.0.3"
-  }
+  },
+  "homepage": "https://github.com/whoisay/opencode-footprints#readme",
+  "bugs": {
+    "url": "https://github.com/whoisay/opencode-footprints/issues"
+  },
+  "author": "whoisay"
 }
