@@ -4,6 +4,40 @@ import { Plugin } from "@opencode/plugin/tui"
 import type { Context } from "@opencode/plugin/tui/context"
 import type { SessionMessageInfo } from "@opencode/client"
 import { createEffect, createMemo, createSignal, For, onCleanup, Show, untrack } from "solid-js"
+import { appendFileSync } from "node:fs"
+import {
+  displayWidth,
+  formatDate,
+  formatTime,
+  dateKey,
+  groupNodes,
+  latestGroups,
+  navigable,
+  sameTimelineNode,
+  timelineNode,
+  truncate,
+  type TimelineGroup,
+  type TimelineNode,
+} from "./timeline.js"
+
+// 性能埋点：全部受 FOOTPRINTS_PERF=1 控制，发布版默认一行都不写。
+//
+// 曾经的方案是「跳转无条件写、检测受开关控制」，理由是跳转低频。但发布版会
+// 往用户机器上写文件这件事本身就不该默认发生，所以统一收在开关后面。
+//
+// 本地排查：
+//   $env:FOOTPRINTS_PERF=1 ; opencode
+const PERF_LOG = "C:/WINDOWS/TEMP/opencode/footprints-perf.log"
+const PERF_ENABLED = process.env.FOOTPRINTS_PERF === "1"
+
+function perfNote(line: string) {
+  if (!PERF_ENABLED) return
+  try {
+    appendFileSync(PERF_LOG, `${new Date().toISOString()} ${line}\n`)
+  } catch {
+    /* 埋点失败不影响功能 */
+  }
+}
 
 const COMMAND_ID = "footprints.toggle"
 
@@ -16,116 +50,9 @@ const DEFAULT_STEP = 2
 /** 一条用户消息节点（SessionMessageInfo 联合类型中的 user 变体）。 */
 type UserMessage = Extract<SessionMessageInfo, { type: "user" }>
 
-/** 侧边栏只保留渲染和定位所需字段，避免复制完整消息与附件元数据。 */
-type TimelineNode = {
-  id: string
-  created: number
-  summary: string
-  /** 完整消息文本（多行已合并），hover 时折行显示 */
-  full: string
-}
-
-type TimelineGroup = {
-  key: string
-  label: string
-  nodes: TimelineNode[]
-}
-
 /** 类型守卫：只关心 type === "user" 的消息。 */
 function isUser(message: SessionMessageInfo): message is UserMessage {
   return message.type === "user"
-}
-
-/** 计算字符串的终端显示宽度（CJK 记 2 列）。 */
-function displayWidth(value: string) {
-  let width = 0
-  for (const char of value) width += char.codePointAt(0)! > 0xff ? 2 : 1
-  return width
-}
-
-/** 按终端显示宽度截断，超出时追加省略号。 */
-function truncate(value: string, max: number) {
-  if (displayWidth(value) <= max) return value
-  let out = ""
-  let width = 0
-  for (const char of value) {
-    const w = char.codePointAt(0)! > 0xff ? 2 : 1
-    if (width + w > max - 1) break
-    out += char
-    width += w
-  }
-  return out + "…"
-}
-
-
-function timelineNode(message: UserMessage): TimelineNode {
-  const lines = (message.text ?? "")
-    .split("\n")
-    .map((item) => item.trim())
-    .filter((item) => item.length > 0)
-  const files = message.files?.length ?? 0
-  const first = lines[0] ?? (files > 0 ? `[附件 ×${files}]` : "(空消息)")
-  return {
-    id: message.id,
-    created: message.time.created,
-    summary: truncate(first, 34),
-    // 完整文本（多行合并成一段，便于折行显示），留 400 字上限防止极端长消息
-    full: truncate(lines.join(" ") || first, 400),
-  }
-}
-
-function sameTimelineNode(a: TimelineNode, b: TimelineNode) {
-  return a.created === b.created && a.summary === b.summary && a.full === b.full
-}
-
-function pad(value: number) {
-  return value.toString().padStart(2, "0")
-}
-
-function dateKey(created: number) {
-  const date = new Date(created)
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
-}
-
-function formatDate(created: number) {
-  const date = new Date(created)
-  return `${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
-}
-
-function formatTime(created: number) {
-  const date = new Date(created)
-  return `${pad(date.getHours())}:${pad(date.getMinutes())}`
-}
-
-function groupNodes(values: TimelineNode[]) {
-  const groups: TimelineGroup[] = []
-  for (const node of values) {
-    const key = dateKey(node.created)
-    const previous = groups[groups.length - 1]
-    if (previous?.key === key) {
-      previous.nodes.push(node)
-      continue
-    }
-    groups.push({ key, label: formatDate(node.created), nodes: [node] })
-  }
-  return groups
-}
-
-function latestGroups(groups: TimelineGroup[], nodeLimit: number) {
-  const shown: TimelineGroup[] = []
-  let remaining = nodeLimit
-  for (let index = groups.length - 1; index >= 0 && remaining > 0; index--) {
-    const group = groups[index]
-    const nodes = group.nodes.slice(Math.max(0, group.nodes.length - remaining))
-    shown.unshift({ ...group, nodes })
-    remaining -= nodes.length
-  }
-  return shown
-}
-
-/** 宿主跳转命令可定位的用户消息（与宿主实现一致：跳过空白文本消息）。 */
-function navigable(node: UserMessage) {
-  return (node.text ?? "").trim().length > 0
 }
 
 function sleep(ms: number) {
@@ -230,8 +157,42 @@ async function ensureLoaded(context: Context, sessionID: string, id: string): Pr
 
 /** 遮盖层控制：由 setup 里的 slot 渲染提供，不走 dialog（宿主滚动命令会清弹层）。 */
 interface MaskControl {
-  show(preview: string): void
+  show(preview: string, label?: string): void
   drop(): Promise<void>
+}
+
+/**
+ * 跨会话共享的宿主状态。
+ *
+ * 收敛在一个对象里，是因为它们必须在「切会话」和「组件卸载」两个时机同时重置。
+ * 之前散成 7 个 let，切会话时漏掉 lastSeenOffset 就导致检测永久短路——
+ * offset 恰好等于旧值 → 每轮直接 return → 跟随、跳转、选中全部失灵。
+ *
+ * 新增状态只往这个对象里加，resetHostState() 自动覆盖，不会再漏。
+ */
+const host = {
+  /** 宿主的会话区滚动容器，按 scrollHeight 认定后缓存 */
+  scroll: undefined as any,
+  /** 当前节点检测的缓存键、节点引用与结果 */
+  detectKey: "",
+  detectNodes: undefined as TimelineNode[] | undefined,
+  detectResult: { atBottom: false } as { id?: string; atBottom: boolean },
+  /** 上一次检测时的宿主 scrollTop。位置没变就不更新选中，这样点击后的选择能站住 */
+  seenOffset: -1,
+  /** 跳转重入保护：一次跳转未完成时忽略新的点击 */
+  jumping: false,
+  /** 跳转期间及结束后一小段时间内，暂停「当前节点」自动检测 */
+  jumpingUntil: 0,
+}
+
+function resetHostState() {
+  host.scroll = undefined
+  host.detectKey = ""
+  host.detectNodes = undefined
+  host.detectResult = { atBottom: false }
+  host.seenOffset = -1
+  host.jumping = false
+  host.jumpingUntil = 0
 }
 
 /**
@@ -241,24 +202,72 @@ interface MaskControl {
  * 关键：步数必须用宿主当前缓存里的消息列表计算——宿主导航只在这个集合里移动，
  * 用插件的全量列表（服务端历史）会因两边时间差导致光标落偏。
  */
-let jumping = false // 跳转重入保护：一次跳转未完成时忽略新的点击
-let hostJumpingUntil = 0 // 跳转期间及结束后一小段时间内，暂停"当前节点"自动检测
-// 上一次检测时的宿主滚动位置。位置没变就不更新选中——
-// 这样点击跳转后的选中能站住，用户自己滚动时又能立刻恢复跟随。
-let lastSeenOffset = -1
+
+/**
+ * 快速路径：目标行已经挂在渲染树里时，直接把它滚到视口顶部，一次布局到位。
+ *
+ * 宿主内部的 jumpToMessage 就是这么做的（scroll.scrollTop + child.y - viewport.y），
+ * 但它没暴露给插件。这里用同样的算法绕过去。
+ *
+ * 返回 false 表示这条消息还没渲染（窗口外的消息没有节点），调用方必须回退到
+ * 逐条 dispatch——那是唯一能触发宿主向上分页的方式。
+ */
+function scrollToMessageDirectly(context: Context, id: string): boolean {
+  try {
+    const root = (context.renderer as any)?.root
+    if (typeof root?.findDescendantById !== "function") return false
+    const target = root.findDescendantById(id)
+    if (!target) return false
+
+    // 从目标行往上找第一个能滚的祖先
+    let scroll: any = target.parent
+    for (let i = 0; i < 24 && scroll; i++) {
+      if (typeof scroll.scrollTo === "function" && typeof scroll.scrollTop === "number") break
+      scroll = scroll.parent
+    }
+    if (!scroll || typeof scroll.scrollTo !== "function") return false
+
+    const viewport = scroll.viewport ?? scroll
+    const targetY = typeof target.y === "number" ? target.y : target.screenY
+    const viewY = typeof viewport.y === "number" ? viewport.y : 0
+    if (typeof targetY !== "number" || !Number.isFinite(targetY)) return false
+
+    const next = scroll.scrollTop + targetY - viewY - 1
+    if (!Number.isFinite(next)) return false
+    scroll.scrollTo(Math.max(0, next))
+    return true
+  } catch {
+    return false
+  }
+}
 
 async function jumpTo(context: Context, sessionID: string, clicked: TimelineNode, mask: MaskControl) {
-  if (jumping) return
-  jumping = true
-  hostJumpingUntil = Date.now() + 30_000 // 跳转期间全程抑制，结束后在 finally 里重设
+  if (host.jumping) return
+  host.jumping = true
+  const jumpStart = performance.now()
+
+  // 快速路径优先：目标在窗口内时几毫秒到位，不用走逐条 dispatch（每步 180ms）。
+  // 短抑制即可——这里没有逐条布局过程，位置一次就落定。
+  if (scrollToMessageDirectly(context, clicked.id)) {
+    perfNote(`jump: fast path, ${(performance.now() - jumpStart).toFixed(1)}ms, id=${clicked.id.slice(0, 12)}`)
+    host.jumpingUntil = Date.now() + 300
+    host.jumping = false
+    return
+  }
+
+  host.jumpingUntil = Date.now() + 30_000 // 慢路径：逐条 dispatch 期间全程抑制
   let masked = false
   try {
     let hosts = hostUsers(context, sessionID)
-    if (!hosts.some((node) => node.id === clicked.id)) {
+    const needLoad = !hosts.some((node) => node.id === clicked.id)
+    perfNote(`jump: slow path, hostNodes=${hosts.length}, targetPresent=${!needLoad}`)
+    if (needLoad) {
       // 上罩（含目标预览），加载阶段视图滚动全部被遮住。
-      mask.show(truncate(clicked.summary, 34))
+      mask.show(truncate(clicked.summary, 34), "正在加载较早的消息…")
       masked = true
+      await nextFrame() // 同上：先让遮罩画出来，再开始可能阻塞的加载
       const loaded = await ensureLoaded(context, sessionID, clicked.id)
+      perfNote(`jump: ensureLoaded=${loaded}, +${(performance.now() - jumpStart).toFixed(0)}ms`)
       if (!loaded) {
         await mask.drop()
         masked = false
@@ -266,6 +275,7 @@ async function jumpTo(context: Context, sessionID: string, clicked: TimelineNode
         return
       }
       hosts = hostUsers(context, sessionID)
+      perfNote(`jump: after ensure, hostNodes=${hosts.length}, +${(performance.now() - jumpStart).toFixed(0)}ms`)
     }
 
     const index = hosts.findIndex((node) => node.id === clicked.id)
@@ -277,28 +287,52 @@ async function jumpTo(context: Context, sessionID: string, clicked: TimelineNode
       context.ui.toast.show({ message: "当前会话没有可定位的文本消息", variant: "warning" })
       return
     }
+
+    // 每步 dispatch 约 180ms（宿主每次都要重新布局整个消息列表，插件侧改不掉）。
+    // 步数一多，用户就会盯着僵住的界面一两秒，不知道它在动。
+    // 预估超过 600ms 就提前把过程盖住；2 步以内约 220ms，上遮罩反而闪一下更烦。
+    // 600ms 这个门槛配合遮罩 800ms 的最短显示，不会把短跳转拖长。
+    const estimatedCost = steps * 180
+    if (!masked && estimatedCost > 600) {
+      mask.show(truncate(clicked.summary, 34), "正在跳转…")
+      masked = true
+      // 让遮罩真正画出来再开始 dispatch。不这一帧的话，紧接着的同步 dispatch
+      // 会把主线程占住，遮罩被压到跳转快结束时才出现，看起来就是闪一下。
+      await nextFrame()
+      perfNote(`jump: mask up, steps=${steps}, estimated=${estimatedCost}ms`)
+    }
     let positioned = false
     try {
+      perfNote(`jump: steps=${steps}, dispatching last_user, +${(performance.now() - jumpStart).toFixed(0)}ms`)
       context.keymap.dispatch("session.messages_last_user")
+      perfNote(`jump: last_user done, +${(performance.now() - jumpStart).toFixed(0)}ms`)
 
       if (masked) {
         // 首次分页后，data 中出现目标早于 createSessionRows 完成。last_user 会触发
-        // ensureAllRows；等最终落点的 renderable 出现后，再让起点锚定回调走完两帧。
+        // ensureAllRows；等最终落点的 renderable 出现后再继续。
+        //
+        // 这里原本还有一次 waitForFrames(2)，实测在宿主刚做完全量布局时会被排到
+        // 1.2 秒之后才执行——等两帧变成等一点二秒，纯属浪费，已去掉。
         const mounted = await waitForRenderable(context, landing.id)
+        perfNote(`jump: waitForRenderable=${mounted}, +${(performance.now() - jumpStart).toFixed(0)}ms`)
         if (!mounted) {
           context.ui.toast.show({ message: "消息已加载，但会话行尚未准备好", variant: "warning" })
           return
         }
-        await waitForFrames(2)
       }
 
-      // 逐条 dispatch 是宿主唯一支持的跳转方式，但一次跳很远时（上百步）
-      // 会连续渲染上百次、把界面卡死。每 8 步让出一帧，保持可响应。
+      // 逐条 dispatch 是宿主唯一支持的跳转方式。
+      //
+      // 短距离（几 步）如果连续跑完，宿主会连续重渲染几次而不释放主线程，
+      // 看起来就是「卡一下」。所以几步之内每一步都让一帧，让渲染均匀铺开。
+      // 长距离（上百步）如果每步都让帧会拖到一两秒，退化成每 8 步一次。
+      const frameEvery = steps <= 8 ? 1 : 8
       for (let i = 0; i < steps; i++) {
         context.keymap.dispatch("session.message.user.previous")
-        if (i % 8 === 7) await nextFrame()
+        if ((i + 1) % frameEvery === 0) await nextFrame()
       }
       positioned = true
+      perfNote(`jump: loop done, +${(performance.now() - jumpStart).toFixed(0)}ms`)
     } catch {
       context.ui.toast.show({ message: "当前版本不支持消息跳转", variant: "warning" })
     }
@@ -310,9 +344,10 @@ async function jumpTo(context: Context, sessionID: string, clicked: TimelineNode
     }
   } finally {
     if (masked) await mask.drop()
-    jumping = false
+    perfNote(`jump: total ${(performance.now() - jumpStart).toFixed(0)}ms`)
+    host.jumping = false
     // 跳转结束后宿主可能还在异步滚动，再给 800ms 让位置稳定
-    hostJumpingUntil = Date.now() + 800
+    host.jumpingUntil = Date.now() + 800
   }
 }
 
@@ -326,7 +361,7 @@ const COLORS = {
   background: "#2a2622", // 遮罩：暖深灰
 }
 
-type MaskState = { show: boolean; preview: string }
+type MaskState = { show: boolean; preview: string; label: string }
 
 /** 全屏遮盖层：绝对定位 + 高 zIndex，盖在会话区上（不依赖 dialog，不会被宿主滚动命令清掉）。 */
 function MaskVeil(props: { mask: MaskState }) {
@@ -346,7 +381,7 @@ function MaskVeil(props: { mask: MaskState }) {
         <box border borderColor={COLORS.accent} paddingLeft={2} paddingRight={2} paddingTop={1} paddingBottom={1} flexDirection="column">
           <box flexDirection="row" gap={1}>
             <text fg={COLORS.accent}>{"◆"}</text>
-            <text fg={COLORS.text}>{"正在定位消息…"}</text>
+            <text fg={COLORS.text}>{props.mask.label || "正在定位消息…"}</text>
           </box>
           <text fg={COLORS.muted}>{props.mask.preview}</text>
         </box>
@@ -360,6 +395,7 @@ type PanelProps = {
   sessionID: string
   visibleRows: number
   scroll: boolean
+  scrollStep: number
   mask: MaskControl
 }
 
@@ -370,13 +406,9 @@ type PanelProps = {
  * scrollHeight 是渲染行数，不是消息条数。
  */
 // 宿主会话区 scrollbox 的缓存：避免每 150ms 都遍历整棵渲染树
-let hostScrollCache: any
 // 上一次检测的 key（scrollTop + 节点版本）与结果，没变化就直接复用
-let lastDetectKey = ""
-let lastDetectResult: { id?: string; atBottom: boolean } = { atBottom: false }
 // 缓存还要比对节点数组的引用：pool 全量替换时中段节点可能增删，
 // 而 offset/length/lastId 三者都可能不变，只靠 key 会返回已经失效的 id。
-let lastDetectNodes: TimelineNode[] | undefined
 
 /** 收集某个渲染节点的所有祖先（时间线面板就挂在侧边栏里，侧边栏容器不能被当成会话区）。 */
 function ancestorSet(node: any): Set<any> {
@@ -406,12 +438,12 @@ function getHostScroll(context: Context, exclude?: unknown) {
   const blocked = exclude ? ancestorSet(exclude) : new Set<any>()
   if (exclude) blocked.add(exclude)
   if (
-    hostScrollCache &&
-    !blocked.has(hostScrollCache) &&
-    typeof hostScrollCache.scrollTop === "number" &&
-    (hostScrollCache.scrollHeight ?? 0) > 0
+    host.scroll &&
+    !blocked.has(host.scroll) &&
+    typeof host.scroll.scrollTop === "number" &&
+    (host.scroll.scrollHeight ?? 0) > 0
   ) {
-    return hostScrollCache
+    return host.scroll
   }
   try {
     const root = (context.renderer as any)?.root
@@ -433,12 +465,38 @@ function getHostScroll(context: Context, exclude?: unknown) {
     const found = boxes
       .filter((box) => !blocked.has(box) && !(exclude && containsNode(box, exclude)))
       .sort((a, b) => b.scrollHeight - a.scrollHeight)[0]
-    hostScrollCache = found
+    host.scroll = found
     return found
   } catch {
-    hostScrollCache = undefined
+    host.scroll = undefined
     return undefined
   }
+}
+
+/**
+ * 一次遍历宿主会话区，收集「消息 id → screenY」。
+ *
+ * 替代对每条消息调用 root.findDescendantById 的写法：后者每次都是整树递归，
+ * 220 条消息就是 220 次全树遍历，实测单次检测 380ms。
+ *
+ * 从 scroll 子树开始走而不是从 root，顺带排除了时间线自己的节点——
+ * 时间线也挂了 id，全局查找会撞名。
+ *
+ * 同一个 id 出现多次时保留最先遇到的那个，和 findDescendantById 的深度优先顺序一致。
+ */
+function snapshotPositions(scroll: any): Map<string, number> {
+  const positions = new Map<string, number>()
+  const walk = (node: any, depth: number) => {
+    if (!node || depth > 20) return
+    const id = node.id
+    if (typeof id === "string" && id.length > 0 && !positions.has(id)) {
+      positions.set(id, typeof node.screenY === "number" ? node.screenY : 0)
+    }
+    const kids = typeof node.getChildren === "function" ? node.getChildren() : []
+    for (const kid of kids) walk(kid, depth + 1)
+  }
+  walk(scroll, 0)
+  return positions
 }
 
 function detectCurrentNode(
@@ -453,7 +511,7 @@ function detectCurrentNode(
     const offset = scroll.scrollTop ?? 0
     const lastId = nodes[nodes.length - 1]?.id ?? ""
     const key = `${offset}|${nodes.length}|${lastId}`
-    if (key === lastDetectKey && nodes === lastDetectNodes) return lastDetectResult
+    if (key === host.detectKey && nodes === host.detectNodes) return host.detectResult
 
     const viewport = scroll.viewport ?? scroll
     const top = viewport.screenY ?? 0
@@ -467,24 +525,27 @@ function detectCurrentNode(
       result = { id: nodes[nodes.length - 1]?.id, atBottom: true }
     } else {
       // 视口顶部之上（含）的最后一条；滚到最顶上时退回第一条
-      const root = (context.renderer as any)?.root
+      //
+      // 这里必须一次遍历建位置表，不能对每条消息调 findDescendantById：
+      // 后者每次都是从根节点整树递归，220 条消息就是 220 次全树遍历，
+      // 实测单次检测 380ms，而 follow 每 150ms 就跑一次，界面会被完全占住。
+      //
+      // 从 scroll（宿主会话区）子树开始走，顺带排除了时间线自己的节点——
+      // 时间线也挂了 id，从 root 全局查找会撞名。
+      const positions = snapshotPositions(scroll)
       let best: string | undefined
       for (const node of nodes) {
-        const target =
-          typeof root?.findDescendantById === "function"
-            ? root.findDescendantById(node.id)
-            : undefined
-        if (!target) continue
-        const y = target.screenY ?? 0
+        const y = positions.get(node.id)
+        if (y === undefined) continue
         if (y <= top + 1) best = node.id
         else break
       }
       result = { id: best, atBottom: false }
     }
 
-    lastDetectKey = key
-    lastDetectResult = result
-    lastDetectNodes = nodes
+    host.detectKey = key
+    host.detectResult = result
+    host.detectNodes = nodes
     return result
   } catch {
     return { atBottom: false }
@@ -745,13 +806,7 @@ function UserNodesPanel(props: PanelProps) {
     untrack(() => {
       // 跨会话的模块级缓存必须清空：宿主的 scrollbox 会重建，
       // 旧缓存的 scrollTop 若恰好和新会话相同，会让检测永久短路。
-      hostScrollCache = undefined
-      lastDetectKey = ""
-      lastDetectNodes = undefined
-      lastDetectResult = { atBottom: false }
-      lastSeenOffset = -1
-      hostJumpingUntil = 0
-      jumping = false
+      resetHostState()
       manualScrollUntil = 0
       wasAtBottom = false
 
@@ -798,24 +853,31 @@ function UserNodesPanel(props: PanelProps) {
   }
 
   const follow = setInterval(() => {
-    if (Date.now() < hostJumpingUntil) return
+    if (Date.now() < host.jumpingUntil) return
 
     // 选中的节点被移出列表（pool 全量替换、分页窗口变化）时，
     // 清掉这个幽灵选中并强制下一轮重新判定，否则绿点会一直消失。
     const currentSelected = selected()
     if (currentSelected && !pool().has(currentSelected)) {
       setSelected("")
-      lastSeenOffset = -1
+      host.seenOffset = -1
     }
 
     // 只在宿主滚动位置真的变化时才重新判定"当前节点"。
     // 位置没变 → 保持现状（点击跳转后的选择不会被自动检测覆盖）。
     const scroll = getHostScroll(props.context, timelineScroll) as any
     const offset = typeof scroll?.scrollTop === "number" ? scroll.scrollTop : -1
-    if (offset === lastSeenOffset) return
-    lastSeenOffset = offset
+    if (offset === host.seenOffset) return
+    host.seenOffset = offset
 
+    const detectStart = performance.now()
     const found = detectCurrentNode(props.context, readyNodes(), timelineScroll)
+    // TEMP perf probe：正常一次遍历约 30ms，只有明显异常时才记录，
+    // 否则每次滚动都写一行，日志会一直长。
+    const detectCost = performance.now() - detectStart
+    if (detectCost > 60) {
+      perfNote(`detect ${detectCost.toFixed(1)}ms nodes=${readyNodes().length} offset=${offset}`)
+    }
     if (found.id && found.id !== selected()) {
       setSelected(found.id)
       // 让时间线也跟着滚到当前节点，否则绿点会跑出可视范围，看起来像"消失"
@@ -862,13 +924,7 @@ function UserNodesPanel(props: PanelProps) {
     clearInterval(follow)
     clearInterval(syncBar)
     // 组件卸载时同样清空跨会话状态，避免重开面板后命中旧缓存
-    hostScrollCache = undefined
-    lastDetectKey = ""
-    lastDetectNodes = undefined
-    lastDetectResult = { atBottom: false }
-    lastSeenOffset = -1
-    jumping = false
-    hostJumpingUntil = 0
+    resetHostState()
   })
 
   const nodes = createMemo(() => [...pool().values()].sort((a, b) => a.created - b.created))
@@ -920,12 +976,12 @@ function UserNodesPanel(props: PanelProps) {
           const id = propsRow.node.id
           setSelected(id)
           // 跳转期间暂停自动跟随，跳完再交还
-          hostJumpingUntil = Date.now() + 1500
+          host.jumpingUntil = Date.now() + 1500
           void jumpTo(props.context, props.sessionID, propsRow.node, props.mask).then(() => {
             // 跳转落地：把当前位置记为"已见过"，下一轮检测不会覆盖这次选中
             const scroll = getHostScroll(props.context, timelineScroll) as any
-            lastSeenOffset = typeof scroll?.scrollTop === "number" ? scroll.scrollTop : -1
-            hostJumpingUntil = Date.now() + 300
+            host.seenOffset = typeof scroll?.scrollTop === "number" ? scroll.scrollTop : -1
+            host.jumpingUntil = Date.now() + 300
           })
         }}
         onMouseOver={() => {
@@ -1141,22 +1197,27 @@ export default Plugin.define({
 
     // 遮盖层状态（内存态，重启即弃），配合 app 级 slot 渲染全屏定位遮罩。
     const [mask, setMask] = context.storage.memory("mask", {
-      initial: { show: false, preview: "" } as MaskState,
+      initial: { show: false, preview: "", label: "" } as MaskState,
     })
     let maskShownAt = 0
     const maskControl: MaskControl = {
-      show(preview) {
+      show(preview, label) {
         maskShownAt = Date.now()
         setMask((draft) => {
           draft.show = true
           draft.preview = preview
+          draft.label = label ?? "正在定位消息…"
         })
       },
       async drop() {
         if (!mask.show) return
-        // 最短显示 800ms：加载太快时视觉上也是"有内容的定位中"，而不是残影。
-        const remain = 800 - (Date.now() - maskShownAt)
+        // 遮罩只在预估超过 600ms 时才出现，所以最短显示取 400ms 就够——
+        // 它不会超过跳转本身，也就不会额外拖延，同时避免极快跳转时闪一下残影。
+        const remain = 400 - (Date.now() - maskShownAt)
         if (remain > 0) await sleep(remain)
+        // 关键：至少让出一帧再撤。show() 之后如果主线程被同步 dispatch 占住，
+        // 遮罩根本没机会被画出来，等到快结束时才闪一下——这一帧就是为了避免那种残影。
+        await nextFrame()
         setMask((draft) => {
           draft.show = false
         })

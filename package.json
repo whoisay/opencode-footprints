@@ -30,6 +30,8 @@
     "build": "babel src --out-dir dist --extensions .ts,.tsx",
     "prepublishOnly": "npm run build",
     "typecheck": "tsc --noEmit",
+    "test": "node --test \"test/*.test.mjs\"",
+    "verify": "tsc --noEmit && babel src --out-dir dist --extensions .ts,.tsx && node --test \"test/*.test.mjs\"",
     "prepare": "npm run build"
   },
   "dependencies": {
