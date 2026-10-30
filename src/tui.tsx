@@ -243,6 +243,9 @@ interface MaskControl {
  */
 let jumping = false // 跳转重入保护：一次跳转未完成时忽略新的点击
 let hostJumpingUntil = 0 // 跳转期间及结束后一小段时间内，暂停"当前节点"自动检测
+// 上一次检测时的宿主滚动位置。位置没变就不更新选中——
+// 这样点击跳转后的选中能站住，用户自己滚动时又能立刻恢复跟随。
+let lastSeenOffset = -1
 
 async function jumpTo(context: Context, sessionID: string, clicked: TimelineNode, mask: MaskControl) {
   if (jumping) return
@@ -289,7 +292,12 @@ async function jumpTo(context: Context, sessionID: string, clicked: TimelineNode
         await waitForFrames(2)
       }
 
-      for (let i = 0; i < steps; i++) context.keymap.dispatch("session.message.user.previous")
+      // 逐条 dispatch 是宿主唯一支持的跳转方式，但一次跳很远时（上百步）
+      // 会连续渲染上百次、把界面卡死。每 8 步让出一帧，保持可响应。
+      for (let i = 0; i < steps; i++) {
+        context.keymap.dispatch("session.message.user.previous")
+        if (i % 8 === 7) await nextFrame()
+      }
       positioned = true
     } catch {
       context.ui.toast.show({ message: "当前版本不支持消息跳转", variant: "warning" })
@@ -366,12 +374,40 @@ let hostScrollCache: any
 // 上一次检测的 key（scrollTop + 节点版本）与结果，没变化就直接复用
 let lastDetectKey = ""
 let lastDetectResult: { id?: string; atBottom: boolean } = { atBottom: false }
+// 缓存还要比对节点数组的引用：pool 全量替换时中段节点可能增删，
+// 而 offset/length/lastId 三者都可能不变，只靠 key 会返回已经失效的 id。
+let lastDetectNodes: TimelineNode[] | undefined
 
-/** 找到宿主的会话区滚动容器（内容最高、且不是时间线自己那个），结果缓存。 */
+/** 收集某个渲染节点的所有祖先（时间线面板就挂在侧边栏里，侧边栏容器不能被当成会话区）。 */
+function ancestorSet(node: any): Set<any> {
+  const out = new Set<any>()
+  let cur = node?.parent ?? null
+  let guard = 0
+  while (cur && guard++ < 64) {
+    out.add(cur)
+    cur = cur.parent ?? null
+  }
+  return out
+}
+
+/** 子树里是否包含目标节点（parent 链不可用时的兜底判据）。 */
+function containsNode(node: any, target: any, depth = 0): boolean {
+  if (!node || depth > 24) return false
+  if (node === target) return true
+  const kids = typeof node.getChildren === "function" ? node.getChildren() : []
+  for (const kid of kids) {
+    if (containsNode(kid, target, depth + 1)) return true
+  }
+  return false
+}
+
+/** 找到宿主的会话区滚动容器（内容最高的滚动区，排除时间线自己及其祖先）。 */
 function getHostScroll(context: Context, exclude?: unknown) {
+  const blocked = exclude ? ancestorSet(exclude) : new Set<any>()
+  if (exclude) blocked.add(exclude)
   if (
     hostScrollCache &&
-    hostScrollCache !== exclude &&
+    !blocked.has(hostScrollCache) &&
     typeof hostScrollCache.scrollTop === "number" &&
     (hostScrollCache.scrollHeight ?? 0) > 0
   ) {
@@ -395,7 +431,7 @@ function getHostScroll(context: Context, exclude?: unknown) {
     }
     walk(root, 0)
     const found = boxes
-      .filter((box) => box !== exclude)
+      .filter((box) => !blocked.has(box) && !(exclude && containsNode(box, exclude)))
       .sort((a, b) => b.scrollHeight - a.scrollHeight)[0]
     hostScrollCache = found
     return found
@@ -417,7 +453,7 @@ function detectCurrentNode(
     const offset = scroll.scrollTop ?? 0
     const lastId = nodes[nodes.length - 1]?.id ?? ""
     const key = `${offset}|${nodes.length}|${lastId}`
-    if (key === lastDetectKey) return lastDetectResult
+    if (key === lastDetectKey && nodes === lastDetectNodes) return lastDetectResult
 
     const viewport = scroll.viewport ?? scroll
     const top = viewport.screenY ?? 0
@@ -443,11 +479,12 @@ function detectCurrentNode(
         if (y <= top + 1) best = node.id
         else break
       }
-      result = { id: best ?? nodes[0]?.id, atBottom: false }
+      result = { id: best, atBottom: false }
     }
 
     lastDetectKey = key
     lastDetectResult = result
+    lastDetectNodes = nodes
     return result
   } catch {
     return { atBottom: false }
@@ -706,6 +743,18 @@ function UserNodesPanel(props: PanelProps) {
   createEffect(() => {
     props.sessionID
     untrack(() => {
+      // 跨会话的模块级缓存必须清空：宿主的 scrollbox 会重建，
+      // 旧缓存的 scrollTop 若恰好和新会话相同，会让检测永久短路。
+      hostScrollCache = undefined
+      lastDetectKey = ""
+      lastDetectNodes = undefined
+      lastDetectResult = { atBottom: false }
+      lastSeenOffset = -1
+      hostJumpingUntil = 0
+      jumping = false
+      manualScrollUntil = 0
+      wasAtBottom = false
+
       initialSessionID = props.sessionID
       setInitialReady(false)
       setSelected("")
@@ -730,17 +779,55 @@ function UserNodesPanel(props: PanelProps) {
 
   // 跟随宿主视口：反查当前显示的是哪条用户消息，实时更新选中。
   // 点击跳转期间暂停，避免自动检测把刚选中的节点又冲掉。
+  /** 把时间线滚到指定节点（日期标题 1 行 + 每条节点 1 行累加出行号）。 */
+  function revealNode(id: string) {
+    if (Date.now() < manualScrollUntil) return
+    const groupsNow = groups()
+    let line = 0
+    for (const group of groupsNow) {
+      line += 1
+      for (const node of group.nodes) {
+        if (node.id === id) {
+          const scroll = timelineScroll as any
+          if (typeof scroll?.scrollTo === "function") scroll.scrollTo(Math.max(0, line - 1))
+          return
+        }
+        line += 1
+      }
+    }
+  }
+
   const follow = setInterval(() => {
     if (Date.now() < hostJumpingUntil) return
+
+    // 选中的节点被移出列表（pool 全量替换、分页窗口变化）时，
+    // 清掉这个幽灵选中并强制下一轮重新判定，否则绿点会一直消失。
+    const currentSelected = selected()
+    if (currentSelected && !pool().has(currentSelected)) {
+      setSelected("")
+      lastSeenOffset = -1
+    }
+
+    // 只在宿主滚动位置真的变化时才重新判定"当前节点"。
+    // 位置没变 → 保持现状（点击跳转后的选择不会被自动检测覆盖）。
+    const scroll = getHostScroll(props.context, timelineScroll) as any
+    const offset = typeof scroll?.scrollTop === "number" ? scroll.scrollTop : -1
+    if (offset === lastSeenOffset) return
+    lastSeenOffset = offset
+
     const found = detectCurrentNode(props.context, readyNodes(), timelineScroll)
-    if (found.id && found.id !== selected()) setSelected(found.id)
+    if (found.id && found.id !== selected()) {
+      setSelected(found.id)
+      // 让时间线也跟着滚到当前节点，否则绿点会跑出可视范围，看起来像"消失"
+      revealNode(found.id)
+    }
     // 宿主贴底（比如点了 jump to latest）：时间线也回到最新。
     // 只在"由非贴底变成贴底"那一下联动，之后不再干预用户操作。
     if (found.atBottom) {
       if (!wasAtBottom && Date.now() >= manualScrollUntil) {
         const s = timelineScroll as any
         if (s && typeof s.scrollTop === "number" && typeof s.scrollHeight === "number") {
-          if (s.scrollTop + props.visibleRows < s.scrollHeight - 1) s.scrollTo(s.scrollHeight)
+          if (s.scrollTop + panelHeight() < s.scrollHeight - 1) s.scrollTo(s.scrollHeight)
         }
       }
       wasAtBottom = true
@@ -753,7 +840,7 @@ function UserNodesPanel(props: PanelProps) {
   function updateBar() {
     const scroll = timelineScroll as any
     if (!scroll || typeof scroll.scrollTop !== "number" || typeof scroll.scrollHeight !== "number") return
-    const view = props.visibleRows
+    const view = panelHeight()
     const total = scroll.scrollHeight
     if (total > view) {
       const size = Math.max(1, Math.round((view * view) / total))
@@ -774,6 +861,14 @@ function UserNodesPanel(props: PanelProps) {
     clearInterval(poll)
     clearInterval(follow)
     clearInterval(syncBar)
+    // 组件卸载时同样清空跨会话状态，避免重开面板后命中旧缓存
+    hostScrollCache = undefined
+    lastDetectKey = ""
+    lastDetectNodes = undefined
+    lastDetectResult = { atBottom: false }
+    lastSeenOffset = -1
+    jumping = false
+    hostJumpingUntil = 0
   })
 
   const nodes = createMemo(() => [...pool().values()].sort((a, b) => a.created - b.created))
@@ -808,6 +903,11 @@ function UserNodesPanel(props: PanelProps) {
   }
   // 滚动模式显示全部；静态回退只显示最新 N 条消息，并保留日期标题。
   const shownGroups = createMemo(() => (props.scroll ? groups() : latestGroups(groups(), props.visibleRows)))
+  // 面板高度自适应：消息少时按实际行数收缩，避免大片空旷（每条节点 1 行 + 每个日期标题 1 行）
+  const panelHeight = createMemo(() => {
+    const total = groups().reduce((n, g) => n + 1 + g.nodes.length, 0)
+    return Math.max(1, Math.min(props.visibleRows, total))
+  })
 
   /** 单个节点行（滚动 / 静态两种容器共用）。 */
   function NodeRow(propsRow: { node: TimelineNode }) {
@@ -821,7 +921,12 @@ function UserNodesPanel(props: PanelProps) {
           setSelected(id)
           // 跳转期间暂停自动跟随，跳完再交还
           hostJumpingUntil = Date.now() + 1500
-          void jumpTo(props.context, props.sessionID, propsRow.node, props.mask)
+          void jumpTo(props.context, props.sessionID, propsRow.node, props.mask).then(() => {
+            // 跳转落地：把当前位置记为"已见过"，下一轮检测不会覆盖这次选中
+            const scroll = getHostScroll(props.context, timelineScroll) as any
+            lastSeenOffset = typeof scroll?.scrollTop === "number" ? scroll.scrollTop : -1
+            hostJumpingUntil = Date.now() + 300
+          })
         }}
         onMouseOver={() => {
           clearTimeout(hoverClear)
@@ -859,7 +964,6 @@ function UserNodesPanel(props: PanelProps) {
       zIndex={1}
       paddingLeft={1}
       paddingRight={1}
-      paddingTop={1}
       onMouseScroll={captureTimelineScroll}
       onMouseOver={focusTimelineScroll}
       onMouseOut={blurTimelineScroll}
@@ -915,12 +1019,12 @@ function UserNodesPanel(props: PanelProps) {
           fallback={<For each={shownGroups()}>{(group) => <DateGroup group={group} />}</For>}
         >
           {/* 固定可视行数，剩余全部滚轮滚动；stickyScroll 保证新消息进来时保持在底部 */}
-          <box flexDirection="column" width="100%" height={props.visibleRows}>
+          <box flexDirection="column" width="100%" height={panelHeight()}>
             <scrollbox
               ref={(scroll) => {
                 timelineScroll = scroll
               }}
-              height={props.visibleRows}
+              height={panelHeight()}
               width="100%"
               alignSelf="stretch"
               stickyScroll
@@ -944,11 +1048,11 @@ function UserNodesPanel(props: PanelProps) {
               right={1}
               top={0}
               width={1}
-              height={props.visibleRows}
+              height={panelHeight()}
               zIndex={5}
               flexDirection="column"
             >
-              <For each={Array.from({ length: props.visibleRows }, (_, i) => i)}>
+              <For each={Array.from({ length: panelHeight() }, (_, i) => i)}>
                 {(i) => {
                   // 必须包成 memo：<For> 对相同数字不会重建 children，
                   // 直接写 const on = ... 只会求值一次。
