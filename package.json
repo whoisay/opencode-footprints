@@ -1,6 +1,6 @@
 {
   "name": "opencode-footprints",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "侧边栏「足迹」：当前会话的用户提问时间线，支持点击跳转、按日期切换、跟随当前视口、悬停预览。",
   "license": "MIT",
   "type": "module",
