@@ -5,6 +5,7 @@ import type { Context } from "@opencode/plugin/tui/context"
 import type { SessionMessageInfo } from "@opencode/client"
 import { createEffect, createMemo, createSignal, For, onCleanup, Show, untrack } from "solid-js"
 import { appendFileSync } from "node:fs"
+import { derivePalette, type Palette } from "./color.js"
 import {
   displayWidth,
   formatDate,
@@ -351,8 +352,13 @@ async function jumpTo(context: Context, sessionID: string, clicked: TimelineNode
   }
 }
 
-/** 固定配色：琥珀强调 + 冷白正文。 */
-const COLORS = {
+/**
+ * 兜底配色：琥珀强调 + 冷白正文。
+ *
+ * 实际显示的颜色由 derivePalette 从宿主主题派生，这里只在主题缺字段时兜底。
+ * 保留原来的琥珀色是因为它是「足迹」的识别特征，主题没有 warning 色时不该丢。
+ */
+const FALLBACK_COLORS: Palette = {
   text: "#ece3d4", // 正文：暖白（米白）
   muted: "#9a9088", // 次要：时间、计数、跨度
   accent: "#e0a458", // 强调：标题、选中点、滚动条、日期标题
@@ -360,6 +366,15 @@ const COLORS = {
   border: "#4a4238", // 分隔线：暖灰
   background: "#2a2622", // 遮罩：暖深灰
 }
+
+/**
+ * 当前调色板。
+ *
+ * 模块级 signal 是因为 MaskVeil / Keybinds 这些子组件拿不到 context，
+ * 但它们的 JSX 在渲染时读 palette() 就会订阅，主题变化时跟着重绘。
+ * UserNodesPanel 里有一个 effect 负责把宿主主题喂进来。
+ */
+const [palette, setPalette] = createSignal<Palette>(FALLBACK_COLORS)
 
 type MaskState = { show: boolean; preview: string; label: string }
 
@@ -374,16 +389,16 @@ function MaskVeil(props: { mask: MaskState }) {
         right={0}
         bottom={0}
         zIndex={999}
-        backgroundColor={COLORS.background}
+        backgroundColor={palette().background}
         justifyContent="center"
         alignItems="center"
       >
-        <box border borderColor={COLORS.accent} paddingLeft={2} paddingRight={2} paddingTop={1} paddingBottom={1} flexDirection="column">
+        <box border borderColor={palette().accent} paddingLeft={2} paddingRight={2} paddingTop={1} paddingBottom={1} flexDirection="column">
           <box flexDirection="row" gap={1}>
-            <text fg={COLORS.accent}>{"◆"}</text>
-            <text fg={COLORS.text}>{props.mask.label || "正在定位消息…"}</text>
+            <text fg={palette().accent}>{"◆"}</text>
+            <text fg={palette().text}>{props.mask.label || "正在定位消息…"}</text>
           </box>
-          <text fg={COLORS.muted}>{props.mask.preview}</text>
+          <text fg={palette().muted}>{props.mask.preview}</text>
         </box>
       </box>
     </Show>
@@ -580,9 +595,19 @@ function formatSpan(ms: number): string {
 
 /** 侧边栏面板「足迹」：当前会话的用户消息节点列表（固定行高，剩余的可滚轮滚动）。 */
 function UserNodesPanel(props: PanelProps) {
+  // 主题换色时重算调色板。context.theme 是响应式的，这里读一次就能订阅上；
+  // 子组件（MaskVeil / Keybinds）通过模块级 palette() 自动跟着变。
+  createEffect(() => {
+    setPalette(derivePalette(props.context.theme, FALLBACK_COLORS))
+  })
+
   // 节点池：id → 紧凑时间线节点。TUI 本地缓存只有"已加载窗口"（向上滚动才分页加载更早的），
   // 所以本地缓存负责实时增量，全量历史由 client.message.list 直接向服务端分页拉取。
   const [pool, setPool] = createSignal<Map<string, TimelineNode>>(new Map())
+  // 面板实测宽度，只用来算摘要的截断上限。不手工拼空格，避免差一格就换行。
+  // 初值取保守的 30：万一 onSizeChange 没触发，摘要上限只有 21 列，宁可少显示也不要换行。
+  const [panelWidth, setPanelWidth] = createSignal(30)
+  let rootEl: any
   // 初次打开时先不要把 TUI 的懒加载窗口直接画出来，避免 5 条本地缓存先闪现、
   // 服务端全量回来后又变成 10 条。全量请求失败时仍会揭示本地缓存作为兜底。
   const [initialReady, setInitialReady] = createSignal(false)
@@ -968,6 +993,9 @@ function UserNodesPanel(props: PanelProps) {
   /** 单个节点行（滚动 / 静态两种容器共用）。 */
   function NodeRow(propsRow: { node: TimelineNode }) {
     const active = createMemo(() => selected() === propsRow.node.id)
+    // 摘要可用列数：总宽 - 时间(5) - 两个 gap(2) - 圆点(1) - 安全余量(1)。
+    // 余量是给「宽度测量晚一帧」兜底的，宁可少显示一个字，也不要换行。
+    const summaryLimit = () => Math.max(8, panelWidth() - 5 - 2 - 1 - 1)
     return (
       <box
         flexDirection="row"
@@ -993,10 +1021,10 @@ function UserNodesPanel(props: PanelProps) {
           hoverClear = setTimeout(() => setHovered(undefined), 250)
         }}
       >
-        <text fg={COLORS.muted}>{formatTime(propsRow.node.created)}</text>
-        <text fg={active() ? COLORS.accent : COLORS.muted}>{active() ? "●" : "─"}</text>
-        <text fg={active() ? COLORS.accent : COLORS.text}>
-          {truncate(propsRow.node.summary, 26)}
+        <text fg={palette().muted}>{formatTime(propsRow.node.created)}</text>
+        <text fg={active() ? palette().accent : palette().muted}>{active() ? "●" : "─"}</text>
+        <text fg={active() ? palette().accent : palette().text}>
+          {truncate(propsRow.node.summary, summaryLimit())}
         </text>
       </box>
     )
@@ -1005,7 +1033,7 @@ function UserNodesPanel(props: PanelProps) {
   function DateGroup(propsGroup: { group: TimelineGroup }) {
     return (
       <box flexDirection="column">
-        <text fg={COLORS.accent}>{`── ${propsGroup.group.label} ──`}</text>
+        <text fg={palette().accent}>{`── ${propsGroup.group.label} ──`}</text>
         <For each={propsGroup.group.nodes}>{(node) => <NodeRow node={node} />}</For>
       </box>
     )
@@ -1020,21 +1048,29 @@ function UserNodesPanel(props: PanelProps) {
       zIndex={1}
       paddingLeft={1}
       paddingRight={1}
+      ref={rootEl}
+      onSizeChange={() => {
+        // rootEl.width 是含 padding 的总宽，内容区要减掉左右各 1 列。
+        // 不减的话摘要会多算 2 列，超出部分由 TUI 渲染层裁剪，出现「文字 + 空格 + …」。
+        const raw = rootEl && typeof rootEl.width === "number" ? rootEl.width : 0
+        const width = raw - 2
+        if (width > 0) setPanelWidth((prev) => (prev === width ? prev : width))
+      }}
       onMouseScroll={captureTimelineScroll}
       onMouseOver={focusTimelineScroll}
       onMouseOut={blurTimelineScroll}
       onMouseDown={focusTimelineScroll}
     >
       <box flexDirection="row" gap={1}>
-        <text fg={COLORS.accent}>{"◆ 足迹"}</text>
-        <text fg={COLORS.muted}>{initialReady() ? `(${readyNodes().length})` : "(加载中…)"}</text>
+        <text fg={palette().accent}>{"◆ 足迹"}</text>
+        <text fg={palette().muted}>{initialReady() ? `(${readyNodes().length})` : "(加载中…)"}</text>
       </box>
       {/* 固定占 2 行：不悬停时显示跨度 + 日期切换，悬停时整块换成摘要 */}
       <Show
         when={hovered()}
         fallback={
           <box flexDirection="column" height={2}>
-            <text fg={COLORS.muted} height={1} overflow="hidden">
+            <text fg={palette().muted} height={1} overflow="hidden">
               {(() => {
                 const list = readyNodes()
                 if (list.length === 0) return ""
@@ -1044,14 +1080,14 @@ function UserNodesPanel(props: PanelProps) {
               })()}
             </text>
             <box flexDirection="row" gap={1} height={1}>
-              <text fg={COLORS.muted} onMouseUp={() => jumpToDay(-1)}>
+              <text fg={palette().muted} onMouseUp={() => jumpToDay(-1)}>
                 {"◀"}
               </text>
-              <text fg={COLORS.accent}>{groups()[dayCursor()]?.label ?? "—"}</text>
-              <text fg={COLORS.muted} onMouseUp={() => jumpToDay(1)}>
+              <text fg={palette().accent}>{groups()[dayCursor()]?.label ?? "—"}</text>
+              <text fg={palette().muted} onMouseUp={() => jumpToDay(1)}>
                 {"▶"}
               </text>
-              <text fg={COLORS.border}>
+              <text fg={palette().border}>
                 {groups().length > 0 ? `${dayCursor() + 1}/${groups().length}` : ""}
               </text>
             </box>
@@ -1061,15 +1097,15 @@ function UserNodesPanel(props: PanelProps) {
         <box flexDirection="column" height={2}>
           <For each={[0, 1]}>
             {(i) => (
-              <text fg={COLORS.soft} height={1} overflow="hidden">
+              <text fg={palette().soft} height={1} overflow="hidden">
                 {wrapSummary(hovered()!.full, 30, 2)[i] ?? ""}
               </text>
             )}
           </For>
         </box>
       </Show>
-      <Show when={initialReady()} fallback={<text fg={COLORS.muted}>{"正在加载用户消息…"}</text>}>
-        <Show when={readyNodes().length > 0} fallback={<text fg={COLORS.muted}>{"暂无用户消息"}</text>}>
+      <Show when={initialReady()} fallback={<text fg={palette().muted}>{"正在加载用户消息…"}</text>}>
+        <Show when={readyNodes().length > 0} fallback={<text fg={palette().muted}>{"暂无用户消息"}</text>}>
         <Show
           when={props.scroll}
           fallback={<For each={shownGroups()}>{(group) => <DateGroup group={group} />}</For>}
@@ -1116,7 +1152,7 @@ function UserNodesPanel(props: PanelProps) {
                     const b = bar()
                     return b.visible && i >= b.top && i < b.top + b.size
                   })
-                  return <text fg={COLORS.accent}>{on() ? "▌" : " "}</text>
+                  return <text fg={palette().accent}>{on() ? "▌" : " "}</text>
                 }}
               </For>
             </box>
