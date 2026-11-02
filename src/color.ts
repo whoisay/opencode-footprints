@@ -148,17 +148,23 @@ export type Palette = {
  * 从宿主主题派生调色板。
  *
  * 每个槽位都是「主题取色 → 去饱和 → 失败用兜底」：
- * - text/muted 跟随主题正文色
- * - accent 取主题的 warning（通常是暖橙/琥珀），和足迹原本的配色同源
- * - soft/border/background 取更暗的层级
+ * - text/muted/soft 跟随主题正文的三级灰
+ * - accent 取主题主色（action.primary 的 selected 状态）
+ * - border/background 取更暗的层级
+ *
+ * accent 不能用 feedback.warning：那是语义色，各主题都是同一个黄/橙，
+ * 切主题不会变。也不能用 action.primary.base：那个在主题定义里就是
+ * $text.base（白），是按钮文字色。主色只在 selected 状态里。
  *
  * 主题缺字段时退回 footprints 原来的暖色板，不会退化成纯白/纯黑。
  */
 export function derivePalette(theme: any, fallback: Palette): Palette {
+  const action = theme?.text?.action?.primary
+  const primary = action?.selected ?? action?.focused
   return {
     text: desaturateTo(theme?.text?.base, MAX_SAT, fallback.text),
     muted: desaturateTo(theme?.text?.muted, MAX_SAT, fallback.muted),
-    accent: desaturateTo(theme?.text?.feedback?.warning?.base, MAX_SAT, fallback.accent),
+    accent: primary ? desaturateTo(primary, MAX_SAT, fallback.accent) : fallback.accent,
     soft: desaturateTo(theme?.text?.faint, MAX_SAT, fallback.soft),
     border: desaturateTo(theme?.border?.base, MAX_SAT, fallback.border),
     background: desaturateTo(theme?.background?.raised?.base, MAX_SAT, fallback.background),
